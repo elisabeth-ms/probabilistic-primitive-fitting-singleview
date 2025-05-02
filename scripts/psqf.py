@@ -6,6 +6,13 @@ from sklearn.cluster import KMeans
 from mayavi import mlab
 from scipy.spatial import cKDTree
 import torch.nn.functional as F
+from sklearn.cluster import DBSCAN
+# from pytorch3d.structures import Pointclouds
+# from pytorch3d.ops import estimate_pointcloud_normals
+
+
+
+
 
 def showPoints(point, scale_factor=0.1, color =(1, 0, 0)):
     
@@ -200,7 +207,7 @@ def remove_largest_plane(points_np, distance_threshold=0.01, ransac_n=3, num_ite
         np.ndarray: Point cloud with the largest plane removed.
         np.ndarray: Points on the plane (optional, for visualization/debugging).
     """
-    # Convert to Open3D PointCloud
+    # # Convert to Open3D PointCloud
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_np)
 
@@ -387,7 +394,7 @@ def initialize_theta_pytorch(points, rescale=True):
     
     p0= 1/V
     
-    sigma2 = V ** (1 / 3) / 10
+    sigma2 = V ** (1 / 3) / 10.0
 
     # 6. Estimate semi-axes
     s0 = torch.median(points_rot0.abs(), dim=0).values
@@ -500,6 +507,42 @@ def compute_superquadric_volume(theta):
     superquadric_volume = 4/3*torch.pi*a1 * a2 * a3
     return superquadric_volume
 
+def superquadric_normals(points_local, theta):
+    e1, e2 = theta[0], theta[1]
+    a1, a2, a3 = theta[2], theta[3], theta[4]
+    
+    x = points_local[:, 0]
+    y = points_local[:, 1]
+    z = points_local[:, 2]
+
+    eps = 1e-8  # for numerical stability
+    
+    # Terms
+    x_abs = torch.abs(x / a1) + eps
+    y_abs = torch.abs(y / a2) + eps
+    z_abs = torch.abs(z / a3) + eps
+
+    sgn_x = torch.sign(x)
+    sgn_y = torch.sign(y)
+    sgn_z = torch.sign(z)
+
+    # Intermediate power
+    temp = (x_abs**(2/e2) + y_abs**(2/e2))
+    temp_pow = temp ** (e2/e1 - 1)
+
+    # Gradient in local space
+    dFdx = (2 / e1) * temp_pow * (x_abs ** ((2/e2) - 1)) * (sgn_x / a1) / a1
+    dFdy = (2 / e1) * temp_pow * (y_abs ** ((2/e2) - 1)) * (sgn_y / a2) / a2
+    dFdz = (2 / e1) * (z_abs ** ((2/e1) - 1)) * (sgn_z / a3) / a3
+
+    normals_local = torch.stack([dFdx, dFdy, dFdz], dim=1)
+
+    # Normalize
+    normals_local = F.normalize(normals_local, dim=1)
+
+    return normals_local  # in local frame
+
+
 def compactness_loss(points, probs, theta, weight=1.0):
     point_vol = compute_point_volume(points, probs, theta)
     print("point vol: ", point_vol)
@@ -514,7 +557,36 @@ def compactness_loss(points, probs, theta, weight=1.0):
     return weight * loss
 
 
-def fitting_loss(points, theta, p0, sigma2):
+def superquadric_function(points, theta):
+  
+    # Assume points: (N, 3)
+    e1, e2 = theta[0], theta[1]
+    a1, a2, a3 = theta[2], theta[3], theta[4]
+    rot = theta[5:8]  # Euler angles
+    t = theta[8:11]   # translation vector
+    
+    # print("theta: ", theta)    
+    # Build rotation matrix from Euler angles
+    Rot = build_rotation_matrix(rot)
+
+    
+    # Transform points
+    points_local = points @ Rot - t @ Rot
+    # Normalize by semi-axes
+    x_ = points_local[:, 0] / a1
+    y_ = points_local[:, 1] / a2
+    z_ = points_local[:, 2] / a3
+    
+
+    term1 = (torch.abs(x_)**(2/e2) + torch.abs(y_)**(2/e2))**(e2/e1)
+    term2 = (torch.abs(z_)**(2/e1))
+    inside_outside = term1 + term2
+    
+    
+    return inside_outside
+
+
+def fitting_loss(points, theta, p0, sigma2, normals_est):
     # Assume points: (N, 3)
     e1, e2 = theta[0], theta[1]
     a1, a2, a3 = theta[2], theta[3], theta[4]
@@ -558,8 +630,42 @@ def fitting_loss(points, theta, p0, sigma2):
     c = (2 * torch.pi * sigma2) ** (- 3 / 2)
     w=0.1
     const = (w * p0) / (c * (1 - w))
-    p = torch.exp(-1 / (2 * sigma2) * distances ** 2)
-    p = p / (const + p)
+    
+    dist_term = torch.exp(-1 / (2 * sigma2) * distances ** 2)
+    
+    # normals_sq = superquadric_normals(points, theta)
+    
+    # normal_term = (F.cosine_similarity(normals_est, normals_sq, dim=1) + 1) / 2
+    
+    # normal_term = torch.abs(F.cosine_similarity(normals_est, normals_sq, dim=1))
+
+    # print("normal_term: ", normal_term)
+    
+    # Weight to combine distance and normal terms
+    # alpha = 0.2  # You can tune this
+
+    # Combine them multiplicatively (or you could also use log-additive)
+    # combined_term = dist_term * (normal_term ** alpha)
+    
+    
+
+    # # Mixture model
+    # c = (2 * torch.pi * sigma2) ** (-3 / 2)
+    # w = 0.15  # Outlier prior
+    # const = (w * p0) / (c * (1 - w))
+
+    # Final inlier probability with normal guidance
+    p = dist_term / (const + dist_term)
+    p = torch.clamp(p, min=1e-10)
+    
+    # p = p / (const + p)
+    
+    
+    
+    # cauchy = 1.0 /( torch.sqrt(sigma2)*(1.0 + (distances**2 / sigma2)))
+    # const = (w * p0) / ((1 - w) * c)  # same structure as Gaussian
+    # p = cauchy / (const + cauchy)
+
     
     p = torch.clamp(p, min=1e-10)
     # print("prob: ", p)
@@ -569,6 +675,9 @@ def fitting_loss(points, theta, p0, sigma2):
     cost = p*scaled_distances**2
     
     loss = cost.sum()
+    
+    # loss = torch.sum(torch.log(1 + distances**2 / sigma2))
+
     
     # log_prob = -scaled_distances / (2 * sigma2) - 0.5 * torch.log(2*torch.pi * sigma2)
     # loss = -torch.mean(log_prob)
@@ -582,49 +691,208 @@ def fitting_loss(points, theta, p0, sigma2):
     # p = weights
     return loss, p, distances
 
-def total_loss(points, theta, p0, weight_compactness, sigma2):
-    fit, p, distances = fitting_loss(points, theta, p0, sigma2=sigma2)
-    compact = compactness_loss(points, p, theta, weight_compactness)
-    print("compact: ", compact)
-    return fit+compact, p, distances
-point_cloud = read_ply("data/case_2.ply")
+
+def total_loss(points, theta, p0, weight_compactness, sigma2, normals_est, number_of_rays, number_samples_per_ray, ray_samples_flat):
+    fit, p, distances = fitting_loss(points, theta, p0, sigma2=sigma2, normals_est=normals_est)
+    
+    print("fit: ", fit)
+
+    
+    
+    # values = superquadric_function(ray_samples_flat, theta)
+    # print("values: ")
+    # inside = values < 1.0
+    # penalty = inside.float().sum() / len(ray_samples_flat)
+    
+    # print("samples: ", len(ray_samples_flat))
+    # print("inside: ", inside.float().sum())
+    # print("penaly1:", penalty)
+
+    inside_score = superquadric_function(ray_samples_flat, theta)
+    soft_inside = torch.sigmoid(-(inside_score - 1) * 10)  # sharpness ≈ 10–100
+    # penalty = soft_inside.sum()    
+    penalty = soft_inside.view(number_of_rays, -1).max(dim=1).values.mean()
+    print("penalty: ", penalty)
+    # Reshape back to (N, S) and check if any point along ray is inside
+    # inside_any = inside.view(N, samples_per_ray).any(dim=1)  # (N,)
+    
+    # compact = compactness_loss(points, p, theta, weight_compactness)
+    # print("penalty: ", penalty)
+    
+    # loss += lambda_entropy * entropy_penalty
+
+    # f_vals = superquadric_function(ray_samples_flat, theta)  # shape (N * S,)
+    
+    # print("f_vals: ", f_vals)
+    
+    # print(torch.sum(f_vals < 1.0))
+    # print("N*S", number_of_rays*number_samples_per_ray)
+    
+    # # Detach to avoid autograd
+    # ray_samples_flat = ray_samples_flat.detach()
+
+    # # Evaluate superquadric function: returns (N*S,) values
+    # f_vals = superquadric_function(ray_samples_flat, theta)
+
+    # # Reshape back: (N, S)
+    # f_vals_per_ray = f_vals.view(number_of_rays, number_samples_per_ray)
+
+    # # Count number of points inside for each ray (f_val < 1)
+    # inside_mask = f_vals_per_ray < 1.0
+    # per_ray_inside_count = inside_mask.sum(dim=1)  # shape (N,)
+
+    # # Total or average, if needed
+    # total_inside = inside_mask.sum()
+    # average_inside_per_ray = per_ray_inside_count.float().mean()
+
+    # print("Total inside samples:", total_inside.item())
+    # print("Per-ray counts:", per_ray_inside_count)
+    # print("Average inside per ray:", average_inside_per_ray.item())
+    
+
+    return fit+1.0*penalty, p, distances
+  
+  
+  
+  
+
+point_cloud = read_ply("data/case_220.ply")
 point_cloud = remove_close_points(point_cloud, 0.01)
 
-filtered_points, plane_points = remove_largest_plane(point_cloud, distance_threshold=0.015)
 
-filtered_points = filter_by_z(filtered_points, -np.inf, 1.1)
+all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
+
+
+# camera_origin = torch.zeros((1, 3), device=points.device)   # (1, 3)
+# dirs = points - camera_origin                               # (N, 3)
+# dirs = dirs / torch.norm(dirs, dim=1, keepdim=True)         # Normalize each ray
+
+
+# num_samples = 50
+# t_vals = torch.linspace(0.0, 1.0, steps=num_samples, device=points.device)  # (50,)
+# t_vals = t_vals.view(1, num_samples, 1)                                     # (1, 50, 1)
+
+# ray_samples = camera_origin.view(1, 1, 3) + t_vals * dirs.view(-1, 1, 3)    # (N, 50, 3)
+# ray_samples_flat = ray_samples.view(-1, 3)                                  # (N*50, 3)
+
+# number_samples_per_ray = 50
+# # Generate sample ratios [0, 1]
+# t = torch.linspace(0.0, 1.0, number_samples_per_ray, device=all_points.device)  # shape (S,)
+    
+# ray_points = all_points[:, None, :] * t[None, :, None]  # (N, S, 3)
+
+# print("points ", point_cloud[:5,:])
+# print("ray points: ", ray_points[:5, :])
+
+# # Flatten to (N*S, 3) to batch evaluate superquadric implicit function
+# ray_samples_flat = ray_points.reshape(-1, 3)
+
+
+
+
+
+
+filtered_points, plane_points = remove_largest_plane(point_cloud, distance_threshold=0.016)
+
+filtered_points = filter_by_z(filtered_points, -np.inf, 0.94)
+
+
 
 
 
 fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-showPoints(filtered_points, scale_factor=0.1)
+showPoints(point_cloud, scale_factor=0.01)
+showPoints(np.array([[0,0,0]]), 0.1, (1,0,0))
+
 mlab.show()
 p= None
 kmeans = KMeans(n_clusters=4).fit(filtered_points)
+clustering = DBSCAN(eps=0.03, min_samples=4).fit(filtered_points)
+n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
+print(f"Number of clusters: {n_clusters}")
+
+camera_origin = torch.zeros_like(all_points)  # shape (N, 3), all (0,0,0)
+directions = all_points - camera_origin  # or just points if origin is (0,0,0)
+
+# Now sample along these rays
+number_samples_per_ray = 200
+number_of_rays = all_points.shape[0]
+
+t_vals = torch.linspace(0, 0.99, number_samples_per_ray, device=all_points.device)  # go slightly past the surface
+ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
+ray_samples_flat = ray_points.reshape(-1, 3)
 
 
-for i in range(5):
-    cluster = filtered_points[kmeans.labels_ == i]
+for i in range(n_clusters):
+    cluster = filtered_points[clustering.labels_ == i]
     loss_per_iteration = []
+    
 
-    fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-    showPoints(filtered_points, scale_factor=0.01)
-    mlab.show()
+
+
     points = torch.tensor(cluster, dtype=torch.float32, device='cuda')  # or 'cpu' if no GPU
-    print("p ",points[0])
+    
+    # camera_origin = torch.zeros_like(points)  # shape (N, 3), all (0,0,0)
+    # directions = points - camera_origin  # or just points if origin is (0,0,0)
+
+    # # Now sample along these rays
+    # number_samples_per_ray = 50
+    # number_of_rays = cluster.shape[0]
+
+    # t_vals = torch.linspace(0, 1.0, number_samples_per_ray, device=points.device)  # go slightly past the surface
+    # ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
+    # ray_samples_flat = ray_points.reshape(-1, 3)
+    
+    # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+    # showPoints(filtered_points, scale_factor=0.01)
+    # ray_samples_flat_np = ray_samples_flat.detach().cpu().numpy()
+    # showPoints(ray_samples_flat_np, scale_factor=0.005, color=(0,1,0))
+    # mlab.show()
+    
     # Initialize superquadric parameters randomly or based on prior knowledge
     points_centered,theta,_, p0, sigma2, t0 = initialize_theta_pytorch(points, False)
+    
+    current_ray_samples_flat = ray_samples_flat - t0
     print("Initial theta: ", theta)
     
     # sigma2 = torch.nn.Parameter(sigma2)
-    optimizer = torch.optim.Adam([theta], lr=1e-3)
+    optimizer = torch.optim.Adam([theta], lr=1e-3, weight_decay=0.001)
 
     iter_sigma = 0
+    
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(cluster)
 
-    for step in range(1000):  # or until convergence
+    # Estimate normals using a k-nearest neighbors search
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=20))
+
+    # Optionally orient normals consistently (e.g., towards camera)
+    pcd.orient_normals_consistent_tangent_plane(k=30)
+
+    # Convert back to numpy array if needed
+    normals = np.asarray(pcd.normals)
+
+    normals = torch.tensor(normals, dtype=torch.float32, device='cuda')  # or 'cpu' if no GPU
+
+    
+    # # Wrap into a batched structure
+    # pc = Pointclouds(points=[points])
+    
+    
+    # normals = estimate_pointcloud_normals(pc, neighborhood_size=20, disambiguate_directions=True)
+
+    # # normals is (1, N, 3) tensor
+    # normals = normals[0]  # remove batch dim → (N, 3)
+
+    
+
+    for step in range(800):  # or until convergence
         optimizer.zero_grad()
 
-        loss, p, distances = total_loss(points_centered, theta, p0, 0.0, sigma2)
+        # if sigma2>1e-4:
+        loss, p, distances = total_loss(points_centered, theta, p0, 0.0, sigma2, normals, number_of_rays, number_samples_per_ray, ray_samples_flat=current_ray_samples_flat)
+        # else:
+        #     loss, p, distances = total_loss(points_centered, theta, p0, 0.0, sigma2, normals_est=normals, ray_samples_flat=ray_samples_flat)
 
         loss_per_iteration.append(loss.item())  # Save it for plotting later
         loss.backward()
@@ -632,28 +900,66 @@ for i in range(5):
 
         # Clamp theta values to stay valid
         with torch.no_grad():
-            print("iter: ", step)
-            print("sigma2: ", sigma2)
-            print("distances: ", distances)
-            print("loss", loss)
-            print("theta grad: ", theta.grad)
-            print("theta: ", theta)
-            print("prob: ", p)
+            # print("iter: ", step)
+            # print("sigma2: ", sigma2)
+            # print("distances: ", distances)
+            # print("loss", loss)
+            # print("theta grad: ", theta.grad)
+            # print("theta: ", theta)
+            # print("prob: ", p)    # camera_origin = torch.zeros_like(points)  # shape (N, 3), all (0,0,0)
+    # directions = points - camera_origin  # or just points if origin is (0,0,0)
+
+    # # Now sample along these rays
+    # number_samples_per_ray = 50
+    # number_of_rays = cluster.shape[0]
+
+    # t_vals = torch.linspace(0, 1.0, number_samples_per_ray, device=points.device)  # go slightly past the surface
+    # ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
+    # ray_samples_flat = ray_points.reshape(-1, 3)
+    
+    # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+    # showPoints(filtered_points, scale_factor=0.01)
+    # ray_samples_flat_np = ray_samples_flat.detach().cpu().numpy()
+    # showPoints(ray_samples_flat_np, scale_factor=0.005, color=(0,1,0))
+    # mlab.show()
+            
+    
+            
+
             iter_sigma+=1
             
             # Update sigma2 every N steps (or every step)
             # if i % 100 == 0:
             #     sigma2 = torch.mean(distances.detach()**2) / 3
 
-            if iter_sigma == 2:
+            if iter_sigma == 5:
                 iter_sigma = 0
                 fitting_error = torch.sum(p*(distances)**2)
                 # print("fittt: ", fitting_error)
                 # sigma2 = 2*fitting_error / (3 * torch.sum(p))
                 
                 sigma2_new = 2 * torch.sum(p * distances**2) / (3 * torch.sum(p) + 1e-8)
-                sigma2 = 0.9 *sigma2+0.1*sigma2_new
-                sigma2 = torch.clamp(sigma2, min=1e-4)
+                sigma2 = 0.8 *sigma2+0.2*sigma2_new
+                
+                # sigma2_new = 2*loss/(3*torch.sum(p)+1e-8)      
+                # sigma2 = 0.8 *sigma2+0.2*sigma2_new
+          
+                # if step < 200:
+                #     k = int(0.3 * len(distances))
+                #     topk_distances, indices = torch.topk(distances, k, largest=False)
+                #     distances = topk_distances
+                #     p= p[indices]
+                
+                # # Robust estimate: pseudo-Huber inspired
+                # sigma2_new = torch.sum(p * distances**2 / (1 + (distances / sigma2)**2)) / (torch.sum(p) + 1e-8)
+
+                # # Or simply clip big outliers in a robustified second moment
+                # clipped = torch.minimum(distances**2, (5.0 * sigma2)**2)  # cap heavy tails
+                # sigma2_new = torch.sum(p * clipped) / (torch.sum(p) + 1e-8)
+
+                # # Update rule with smoothing
+                # sigma2 = 0.8 * sigma2 + 0.2 * sigma2_new
+                # sigma2 = torch.clamp(sigma2, min=1e-4)
                 print("sigma2: ", sigma2)
 
 
@@ -707,9 +1013,10 @@ for i in range(5):
     
     remaining_indices = np.setdiff1d(all_indices, selected_indices_good)
     
-    indices_bad = torch.nonzero(p <= 0.2, as_tuple=False).squeeze()
+    indices_bad = torch.nonzero(p <= 0.2, as_tuple=False).view(-1)
+    print("indices  bad: ", indices_bad)
     selected_indices_bad = indices_bad.cpu().numpy()
-
+    print("indices bad: ", selected_indices_bad)
     remaining_indices1 = np.setdiff1d(remaining_indices, selected_indices_bad)
     
 
@@ -720,10 +1027,10 @@ for i in range(5):
     
     
     showPoints(cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
-    showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
+    if selected_indices_bad.size >0:
+        showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
     showPoints(cluster[remaining_indices1], scale_factor=0.01, color=(0,0,1))
-    showPoints(filtered_points, scale_factor=0.005, color=(0,0.5,0.5))
-
+    showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
     showSuperquadrics(theta_np)
 
     mlab.show()
