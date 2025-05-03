@@ -788,6 +788,8 @@ def superquadric_function(points, theta):
     return inside_outside
 
 
+
+
 def fitting_loss(points, theta, p0, sigma2, normals_est, k):
     # Assume points: (N, 3)
     e1, e2 = theta[0], theta[1]
@@ -897,8 +899,33 @@ def fitting_loss(points, theta, p0, sigma2, normals_est, k):
 
     z_penalty = torch.relu(-z_) ** 2 * 100.0  # weight can be tuned    
 
+    weights = torch.sigmoid((p - 0.8) * 20)  # sigmoid approx. of a threshold at 0.5
+
+    z_vals = points_local[:, 2]
+    z_mean = (weights * z_vals).sum() / weights.sum()
+    z_var = ((weights * (z_vals - z_mean) ** 2).sum()) / weights.sum()
+    z_extent = 2 * torch.sqrt(z_var)*a3  # ≈ 95% of the spread
+    
+    penalty_weight = 0.4
+    # Apply penalty if a3 exceeds z_extent
+    overshoot = torch.relu(a3 - z_extent)
+    extent_penalty = overshoot ** 2 * penalty_weight
     # p = weights
-    return loss+z_penalty.sum(), p, distances
+    
+    allowed_margin = 0.01  # small tolerance below point cloud
+    shape_base_z = t[2]
+    min_z_points = points_local[:, 2].min()
+
+    drop_penalty = torch.relu(min_z_points - shape_base_z - allowed_margin) ** 2 * 10.0
+    
+    z_max = (z_vals).max()
+    print("z_max: ", z_max)
+    print("a3: ", a3)
+    extent_penalty = torch.relu(a3-z_max) ** 2 * 20.0
+
+    print("extent_penalty: ", extent_penalty)
+
+    return loss+z_penalty.sum() + drop_penalty+ extent_penalty, p, distances
 
 
 def total_loss(points, theta, p0, weight_compactness, sigma2, normals_est, number_of_rays, number_samples_per_ray, ray_samples_flat, k):
@@ -925,7 +952,7 @@ def total_loss(points, theta, p0, weight_compactness, sigma2, normals_est, numbe
     # Reshape back to (N, S) and check if any point along ray is inside
     # inside_any = inside.view(N, samples_per_ray).any(dim=1)  # (N,)
     
-    compact = compactness_loss(points, p, theta, weight_compactness)
+    # compact = compactness_loss(points, p, theta, weight_compactness)
     # print("penalty: ", penalty)
     
     # loss += lambda_entropy * entropy_penalty
@@ -957,6 +984,9 @@ def total_loss(points, theta, p0, weight_compactness, sigma2, normals_est, numbe
     # print("Total inside samples:", total_inside.item())
     # print("Per-ray counts:", per_ray_inside_count)
     # print("Average inside per ray:", average_inside_per_ray.item())
+    
+
+
     
 
     return fit+0.0*penalty, p, distances
@@ -1096,6 +1126,7 @@ for i in range(n_clusters):
 
     normals = torch.tensor(normals, dtype=torch.float32, device='cuda')  # or 'cpu' if no GPU
 
+
     
     # # Wrap into a batched structure
     # pc = Pointclouds(points=[points])
@@ -1218,7 +1249,7 @@ for i in range(n_clusters):
     showPoints(cluster[remaining_indices1], scale_factor=0.01, color=(0,0,1))
     showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
     # showSuperquadrics(theta_np)
-    # showSuperparaboloid(theta_np)
+    showSuperparaboloid(theta_np)
     showTaperedSuperparaboloidWithBase(theta_np, k_np)
 
     mlab.show()
