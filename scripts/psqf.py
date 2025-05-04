@@ -552,7 +552,7 @@ def initialize_theta_superparaboloids_pytorch(points, table_normal, rescale=Fals
 
     # # 7. Initial parameters
     e1 = torch.tensor(1.5, device=device)
-    e2 = torch.tensor(1.0, device=device)
+    e2 = torch.tensor(1.5, device=device)
     # a1, a2, a3 = s0[0], s0[1], s0[2]
     
     a3 = a3 = points_rot0[:, 2].max()*3/4
@@ -956,6 +956,10 @@ def superquadric_total_loss(points, theta, p0, weight_compactness, sigma2, numbe
     term2 = (torch.abs(z_)**(2/e1))
     inside_outside = term1 + term2
     
+    # inside_outside = (
+    # (torch.abs(x_).pow(2/e2) + torch.abs(y_).pow(2/e2)).pow(e2/e1)
+    # + torch.abs(z_).pow(2/e1))
+
     
     r_norm = torch.norm(points_local, dim=1)
 
@@ -972,7 +976,6 @@ def superquadric_total_loss(points, theta, p0, weight_compactness, sigma2, numbe
     p = dist_term / (const + dist_term)
     p = torch.clamp(p, min=1e-10)
     
-    p = torch.clamp(p, min=1e-10)
     # print("prob: ", p)
     
     scaled_distances = distances
@@ -1066,20 +1069,24 @@ def total_loss(points, theta, p0, weight_compactness, sigma2, number_of_rays, nu
   
   
 
-point_cloud = read_ply("data/objects2.ply")
-point_cloud = remove_close_points(point_cloud, 0.01)
+point_cloud = read_ply("data/objects4.ply")
+point_cloud = remove_close_points(point_cloud, 0.005)
 
+point_cloud = filter_by_z(point_cloud, -np.inf, 1.94)
 
 all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
 
 
 
 
-point_cloud = filter_by_z(point_cloud, -np.inf, 1.94)
 
 
+fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
+mlab.show()
 
-filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.016)
+
+filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.005)
 print("plane model: ", plane_model)
 
 table_normal = torch.tensor(plane_model[:3], dtype=torch.float32, device='cuda')
@@ -1089,7 +1096,7 @@ table_normal = torch.tensor(plane_model[:3], dtype=torch.float32, device='cuda')
 
 p= None
 kmeans = KMeans(n_clusters=4).fit(filtered_points)
-clustering = DBSCAN(eps=0.03, min_samples=6).fit(filtered_points)
+clustering = DBSCAN(eps=0.03, min_samples=3).fit(filtered_points)
 n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
 print(f"Number of clusters: {n_clusters}")
 
@@ -1097,10 +1104,10 @@ camera_origin = torch.zeros_like(all_points)  # shape (N, 3), all (0,0,0)
 directions = all_points - camera_origin  # or just points if origin is (0,0,0)
 
 # Now sample along these rays
-number_samples_per_ray = 200
+number_samples_per_ray = 100
 number_of_rays = all_points.shape[0]
 
-t_vals = torch.linspace(0, 0.99, number_samples_per_ray, device=all_points.device)  # go slightly past the surface
+t_vals = torch.linspace(0.0, 0.99, number_samples_per_ray, device=all_points.device)  # go slightly past the surface
 ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
 ray_samples_flat = ray_points.reshape(-1, 3)
 
@@ -1111,124 +1118,242 @@ k = torch.nn.Parameter(k)
 all_params_modeled = {}
 
 
+def fit_multiple_shape_to_clusters(clusters_points_np, label="root", depth=0, max_depth=3):
+  n_clusters = len(clusters_points_np)
+  n_steps = 300
 
-for i in range(n_clusters):
-    loss_per_iteration = []
+  # Store everything in lists
+  thetas = []
+  optimizers = []
+  sigma2s = []
+  p0s = []
+  losses_per_step = [[] for _ in range(n_clusters)]
+  points_centered_list = []
+  t0s = []
+  losses = []
+
+  # Initialize all
+  for cluster_np in clusters_points_np:
+      points = torch.tensor(cluster_np, dtype=torch.float32, device='cuda')
+      points_centered, theta, _, p0, sigma2, t0 = initialize_theta_pytorch(points, False)
+      
+      ray_samples = ray_samples_flat - t0
+      
+      thetas.append(theta)
+      optimizers.append(torch.optim.Adam([theta], lr=1e-3))
+      sigma2s.append(sigma2)
+      p0s.append(p0)
+      points_centered_list.append(points_centered)
+      t0s.append(t0)
+      losses.append(None)  # Placeholder for losses per cluster
+
+  # Now interleave the optimization:
+  for step in range(n_steps):
+      # 1. Zero all grads first
+      for opt in optimizers:
+          opt.zero_grad()
+
+      # 2. Compute all losses and backward passes
+      for i in range(n_clusters):
+          theta = thetas[i]
+          points_centered = points_centered_list[i]
+          p0 = p0s[i]
+          sigma2 = sigma2s[i]
+          ray_samples = ray_samples_flat - t0s[i]
+
+          loss, p, distances = superquadric_total_loss(
+              points_centered, theta, p0, 0.0, sigma2,
+              number_of_rays, number_samples_per_ray, ray_samples
+          )
+          losses[i] = (loss, p, distances)
+          loss.backward(retain_graph=True)
+          losses_per_step[i].append(loss.item())
+
+      # 3. Step all optimizers
+      for opt in optimizers:
+          opt.step()
+
+      # 4. Update sigma and clamp theta
+      for i in range(n_clusters):
+          theta = thetas[i]
+          loss, p, distances = losses[i]
+
+          with torch.no_grad():
+              if step % 10 == 0:
+                  sigma2_new = 2 * torch.sum(p * distances ** 2) / (3 * torch.sum(p) + 1e-8)
+                  sigma2s[i] = 0.8 * sigma2s[i] + 0.2 * sigma2_new
+
+              theta[0].clamp_(0.01, 2.0)
+              theta[1].clamp_(0.01, 2.0)
+              theta[2:5].clamp_(0.001, 1.5)
+              theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
+
+      if step % 50 == 0:
+          print(f"Global step {step}: {[l[0].item() for l in losses]}")
+  translated_thetas = []
+  for i, theta in enumerate(thetas):
+      theta = theta.clone()  # (optional if you're not sure)
+      theta[8:11] = theta[8:11] + t0s[i]
+      translated_thetas.append(theta)
+  return translated_thetas
+
+
+def fit_shape_to_cluster(cluster_points_np, superquadric = True):
+  
+
+    # loss_per_iteration = []
     
-    cluster = filtered_points[clustering.labels_ == i]
-    points = torch.tensor(cluster, dtype=torch.float32, device='cuda')
+    points = torch.tensor(cluster_points_np, dtype=torch.float32, device='cuda')
 
     points_centered,theta,_, p0, sigma2, t0 = initialize_theta_pytorch(points, False)
 
-    current_ray_samples_flat = ray_samples_flat - t0
+    camera_position = torch.tensor([0.0, 0.0, 0.0], device=all_points.device)  # shape (3,)
+    cluster_vecs = points - camera_position  # shape (N, 3)
+    cluster_vecs = torch.nn.functional.normalize(cluster_vecs, dim=1)
+    
+    center_dir = torch.mean(cluster_vecs, dim=0)
+    center_dir = center_dir / torch.norm(center_dir)
+    
+    cos_angles = (cluster_vecs @ center_dir)
+    max_angle = torch.acos(torch.clamp(cos_angles.min(), -1.0, 1.0))  # in radians
+    
+    margin = 5 * torch.pi / 180  # radians
+    final_cone_angle = max_angle + margin
+    cos_thresh = torch.cos(final_cone_angle)
+
+    camera_origin = torch.zeros_like(all_points)  # shape (N, 3), all (0,0,0)
+
+    all_vecs = all_points - camera_position
+    all_vecs = torch.nn.functional.normalize(all_vecs, dim=1)
+
+    mask = (all_vecs @ center_dir) > cos_thresh
+    points_in_cone = all_points[mask]
+    
+    camera_origin = torch.zeros_like(points_in_cone)  # shape (N, 3), all (0,0,0)
+    directions = points_in_cone - camera_origin  # or just points if origin is (0,0,0)
+
+    # Now sample along these rays
+    number_samples_per_ray = 100
+    number_of_rays = points_in_cone.shape[0]
+
+    t_vals = torch.linspace(0.0, 0.99, number_samples_per_ray, device=points_in_cone.device)  # go slightly past the surface
+    ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
+    
+    print("len ray: ", ray_samples_flat.shape)
+    
+    current_ray_samples_flat = ray_points.reshape(-1, 3) - t0
+    
+    print("len ray: ", current_ray_samples_flat.shape)
+
+    # current_ray_samples_flat = ray_samples_flat - t0
     print("Initial theta: ", theta)
     
     # sigma2 = torch.nn.Parameter(sigma2)
-    
-    optimizer = torch.optim.Adam([theta,k], lr=1e-3, weight_decay=0.001)
-
     iter_sigma = 0
-    
+
+    if superquadric:
+        optimizer = torch.optim.Adam([theta], lr=1e-3, weight_decay=0.001)
+
+        tolerance = 1e-6  # or something like 1e-4 depending on your scale
+        patience = 20     # number of steps with small change before stopping
+        no_improve_steps = 0
 
 
-    
 
+        for step in range(2500):  # or until convergence
+            optimizer.zero_grad()
 
-    for step in range(600):  # or until convergence
-        optimizer.zero_grad()
+            loss, p, distances = superquadric_total_loss(points_centered, theta, p0, 0.0, sigma2, number_of_rays, number_samples_per_ray, current_ray_samples_flat)
 
-        # if sigma2>1e-4:
-        loss, p, distances = superquadric_total_loss(points_centered, theta, p0, 0.0, sigma2, number_of_rays, number_samples_per_ray, current_ray_samples_flat)
-        # else:
-        #     loss, p, distances = total_loss(points_centered, theta, p0, 0.0, sigma2, normals_est=normals, ray_samples_flat=ray_samples_flat)
+            loss_per_iteration.append(loss.item())  # Save it for plotting later
+            loss.backward()
+            optimizer.step()
+
+            # Clamp theta values to stay valid
+            with torch.no_grad():
+
+                
+                iter_sigma+=1
+                
+
+                if iter_sigma == 10:
+                    iter_sigma = 0
+                    sigma2_new = 2 * torch.sum(p * distances**2) / (3 * torch.sum(p) + 1e-8)
+                    sigma2 = 0.8 *sigma2+0.2*sigma2_new
+                    
+
+                    
+                # Clamp e1 and e2 between [0.1, 2.0]
+                theta[0].clamp_(0.01, 2.0)  # e1
+                theta[1].clamp_(0.01, 2.0)  # e2
+                
+                # Clamp semi-axes a1, a2, a3 to be positive
+                theta[2:5].clamp_(0.001,1.5)  # a1, a2, a3 positive
+                
+                # Optionally clamp rotation angles between [-pi, pi]
+                theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
+            if step>1:
+                loss_change = abs(loss_per_iteration[-1] - loss_per_iteration[-2])
+                if loss_change < tolerance:
+                    no_improve_steps += 1
+                else:
+                    no_improve_steps = 0
+
+                if no_improve_steps >= patience:
+                    print(f"Early stopping at step {step} (Δloss < {tolerance})")
+                    break
+                
+                
+            if step % 100 == 0:
+                print(f"Step {step}: Loss = {loss.item()}")
+        print(theta)
+        theta_np = theta.detach().cpu().numpy()
+        theta = theta.clone()  # (optional if you're not sure)
+        theta[8:11] = theta[8:11] + t0
+        theta_np = theta.detach().cpu().numpy()
+
         
-        loss_per_iteration.append(loss.item())  # Save it for plotting later
-        loss.backward()
-        optimizer.step()
+        
+        points_centered_np = points_centered.detach().cpu().numpy()
 
-        # Clamp theta values to stay valid
-        with torch.no_grad():
+        indices = torch.nonzero(p > 0.9, as_tuple=False).squeeze()
+        
+        all_indices = np.arange(cluster_points_np.shape[0])
+        
+        selected_indices_good = indices.cpu().numpy()
+        
+        remaining_indices = np.setdiff1d(all_indices, selected_indices_good)
+        
+        indices_bad = torch.nonzero(p <= 0.3, as_tuple=False).view(-1)
+        print("indices  bad: ", indices_bad)
+        selected_indices_bad = indices_bad.cpu().numpy()
+        print("indices bad: ", selected_indices_bad)
+        remaining_indices1 = np.setdiff1d(remaining_indices, selected_indices_bad)
+        
 
-            
-            iter_sigma+=1
-            
+        
+        camera_origin1 = torch.zeros_like(points[selected_indices_good])  # shape (N, 3), all (0,0,0)
+        directions1 = points[selected_indices_good] - camera_origin1  # or just points if origin is (0,0,0)
 
-            if iter_sigma == 10:
-                iter_sigma = 0
-                sigma2_new = 2 * torch.sum(p * distances**2) / (3 * torch.sum(p) + 1e-8)
-                sigma2 = 0.8 *sigma2+0.2*sigma2_new
-                
+        k_np = 0
+        free_space_penalty1 = 0
+        if selected_indices_good.size>0:
+            # Now sample along these rays
+            number_samples_per_ray1 = 200
+            number_of_rays1 = points[selected_indices_good].shape[0]
 
-                
-            # Clamp e1 and e2 between [0.1, 2.0]
-            theta[0].clamp_(0.01, 2.0)  # e1
-            theta[1].clamp_(0.01, 2.0)  # e2
-            
-            # Clamp semi-axes a1, a2, a3 to be positive
-            theta[2:5].clamp_(0.001,1.5)  # a1, a2, a3 positive
-            
-            # Optionally clamp rotation angles between [-pi, pi]
-            theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
-            
-            
-            
-            
-        if step % 100 == 0:
-            print(f"Step {step}: Loss = {loss.item()}")
-    print(theta)
-    print("k: ", k)
-    # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-    theta_np = theta.detach().cpu().numpy()
-    theta = theta.clone()  # (optional if you're not sure)
-    theta[8:11] = theta[8:11] + t0
-    theta_np = theta.detach().cpu().numpy()
-    k_np = k.detach().cpu().numpy()
+            t_vals1 = torch.linspace(0, 0.95, number_samples_per_ray1, device=points.device)  # go slightly past the surface
+            ray_points1 = camera_origin1[:, None, :] + t_vals1[None, :, None] * directions1[:, None, :]
+            ray_samples_flat1 = ray_points1.reshape(-1, 3)
 
-    
-    thetas = torch.tensor(theta_np, dtype=torch.float32, device='cuda')  # or 'cpu' if no GPU
-    # Roti = build_rotation_matrix(thetas[5:8])
-    # print("Roti: ", Roti)
-    
-    points_centered_np = points_centered.detach().cpu().numpy()
-    # print(p)
-    # p = torch.clamp(p, max=1.0)
-    indices = torch.nonzero(p > 0.9, as_tuple=False).squeeze()
-    
-    all_indices = np.arange(cluster.shape[0])
-    
-    selected_indices_good = indices.cpu().numpy()
-    
-    remaining_indices = np.setdiff1d(all_indices, selected_indices_good)
-    
-    indices_bad = torch.nonzero(p <= 0.2, as_tuple=False).view(-1)
-    print("indices  bad: ", indices_bad)
-    selected_indices_bad = indices_bad.cpu().numpy()
-    print("indices bad: ", selected_indices_bad)
-    remaining_indices1 = np.setdiff1d(remaining_indices, selected_indices_bad)
-    
-
-    
-    camera_origin1 = torch.zeros_like(points[selected_indices_good])  # shape (N, 3), all (0,0,0)
-    directions1 = points[selected_indices_good] - camera_origin1  # or just points if origin is (0,0,0)
-
-    # Now sample along these rays
-    number_samples_per_ray1 = 200
-    number_of_rays1 = points[selected_indices_good].shape[0]
-
-    t_vals1 = torch.linspace(0, 0.95, number_samples_per_ray1, device=points.device)  # go slightly past the surface
-    ray_points1 = camera_origin1[:, None, :] + t_vals1[None, :, None] * directions1[:, None, :]
-    ray_samples_flat1 = ray_points1.reshape(-1, 3)
-
-    inside_score1 = superquadric_function(ray_samples_flat1, theta)
-    soft_inside1 = torch.sigmoid(-(inside_score1 - 1) * 10)  # sharpness ≈ 10–100
-    # penalty = soft_inside.sum()    
-    free_space_penalty1 = soft_inside1.view(number_of_rays1, -1).max(dim=1).values.mean()
-    print("After optimization checking rays: ", free_space_penalty1)
-    
-    if free_space_penalty1>0.1: #Probably is a open shape, lets model it using a superparaboloid
-        print("lets try to model it using a superparaboloid")
+            inside_score1 = superquadric_function(ray_samples_flat1, theta)
+            soft_inside1 = torch.sigmoid(-(inside_score1 - 1) * 10)  # sharpness ≈ 10–100
+            # penalty = soft_inside.sum()    
+            free_space_penalty1 = soft_inside1.view(number_of_rays1, -1).max(dim=1).values.mean()
+            print("After optimization checking rays: ", free_space_penalty1)
+    else:
         points_centered,theta,_, p0, sigma2, t0 = initialize_theta_superparaboloids_pytorch(points, table_normal, False)
-        optimizer_superparaboloid = torch.optim.Adam([theta,k], lr=1e-3, weight_decay=0.001)
+        optimizer_superparaboloid = torch.optim.Adam([theta], lr=1e-3, weight_decay=0.001)
         k = torch.tensor(0.6)
         k = torch.nn.Parameter(k)
 
@@ -1273,7 +1398,6 @@ for i in range(n_clusters):
           if step % 100 == 0:
               print(f"Step {step}: Loss = {loss.item()}")
         print(theta)
-        print("k: ", k)
         # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
         theta_np = theta.detach().cpu().numpy()
         theta = theta.clone()  # (optional if you're not sure)
@@ -1281,18 +1405,13 @@ for i in range(n_clusters):
         theta_np = theta.detach().cpu().numpy()
         k_np = k.detach().cpu().numpy()
 
-      
-        thetas = torch.tensor(theta_np, dtype=torch.float32, device='cuda')  # or 'cpu' if no GPU
-        # Roti = build_rotation_matrix(thetas[5:8])
-        # print("Roti: ", Roti)
-        
-        points_centered_np = points_centered.detach().cpu().numpy()
-        # print(p)
+
+
         p = torch.clamp(p, max=1.0)
         
         indices = torch.nonzero(p > 0.9, as_tuple=False).view(-1)        
         
-        all_indices = np.arange(cluster.shape[0])
+        all_indices = np.arange(cluster_points_np.shape[0])
         
         selected_indices_good = indices.cpu().numpy()
         
@@ -1303,29 +1422,13 @@ for i in range(n_clusters):
         selected_indices_bad = indices_bad.cpu().numpy()
         print("indices bad: ", selected_indices_bad)
         remaining_indices1 = np.setdiff1d(remaining_indices, selected_indices_bad)
-    
-        all_params_modeled[i] = {"type": "superparaboloid", "theta": theta_np, "k": k_np}
-        fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-        showPoints(cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
-        if selected_indices_bad.size >0:
-            showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
-        showPoints(cluster[remaining_indices1], scale_factor=0.01, color=(0,0,1))
-        showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
-        showTaperedSuperparaboloidWithBase(theta_np, k_np)
-        mlab.show()
+        free_space_penalty1 = 0
 
-    else:
-        all_params_modeled[i] = {"type": "superquadric", "theta": theta_np, "k": 0}
-        fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-        points_np = points.detach().cpu().numpy()
-        showPoints(cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
-        if selected_indices_bad.size >0:
-            showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
-        showPoints(cluster[remaining_indices1], scale_factor=0.01, color=(0,0,1))
-        showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
-        showSuperquadrics(theta_np)
 
-        mlab.show()
+
+    return theta_np,k_np, selected_indices_good,remaining_indices1, selected_indices_bad, free_space_penalty1
+
+
     # import matplotlib.pyplot as plt
 
     # plt.plot(loss_per_iteration)
@@ -1334,6 +1437,57 @@ for i in range(n_clusters):
     # plt.title("Loss vs Iteration")
     # plt.grid(True)
     # plt.show()
+all_params_modeled = {}
+idx = 0
+for i in range(n_clusters):
+    loss_per_iteration = []
+    
+    cluster = filtered_points[clustering.labels_ == i]
+    current_cluster = cluster
+    while current_cluster.shape[0]>20:
+        theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty = fit_shape_to_cluster(current_cluster, True)
+        all_params_modeled[idx] = {"cluster": i,"type": "superquadric", "theta": theta_np, "k": 0, "free_space_penalty":free_space_penalty, "indices_good": selected_indices_good}
+        idx +=1
+        
+        # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+        # showPoints(current_cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
+        # if selected_indices_bad.size >0:
+        #     showPoints(current_cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
+        # showPoints(current_cluster[remaining_indices], scale_factor=0.01, color=(0,0,1))
+        # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
+        # showSuperquadrics(theta_np)
+        # mlab.show()
+        
+
+        # else:
+        #     theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty = fit_shape_to_cluster(current_cluster, False)
+        #     current_cluster = current_cluster[selected_indices_bad]
+        #     all_params_modeled[idx] = {"type": "superparaboloid", "theta": theta_np, "k": k_np}
+        #     idx+=1
+            # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+            # showPoints(cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
+            # if selected_indices_bad.size >0:
+            #     showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
+            # showPoints(cluster[remaining_indices], scale_factor=0.01, color=(0,0,1))
+            # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
+            # showTaperedSuperparaboloidWithBase(theta_np,k_np)
+            # mlab.show()
+        print("all_params", all_params_modeled)
+        for id,params in all_params_modeled.items():
+            if params["free_space_penalty"]>0.03:
+              print("good: ",params["indices_good"])
+              theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad1, free_space_penalty = fit_shape_to_cluster(current_cluster[params["indices_good"]], False)
+              params["type"] = "superparabolid"
+              params["theta"] = theta_np
+              params["k"] = k_np
+              params["free_space_penalty"]=0
+        current_cluster = current_cluster[selected_indices_bad]
+
+#       showTaperedSuperparaboloidWithBase(params['theta'], params['k'])
+# showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
+# mlab.show()
+
+
 
 print(all_params_modeled)
 
@@ -1343,5 +1497,94 @@ for idx,params in all_params_modeled.items():
       showSuperquadrics(params['theta'])
     else:
       showTaperedSuperparaboloidWithBase(params['theta'], params['k'])
-showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
+showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
 mlab.show()
+
+
+# if free_space_penalty1>0.1: #Probably is a open shape, lets model it using a superparaboloid
+#         print("lets try to model it using a superparaboloid")
+        # points_centered,theta,_, p0, sigma2, t0 = initialize_theta_superparaboloids_pytorch(points, table_normal, False)
+        # optimizer_superparaboloid = torch.optim.Adam([theta], lr=1e-3, weight_decay=0.001)
+        # k = torch.tensor(0.6)
+        # k = torch.nn.Parameter(k)
+
+        # for step in range(300):  # or until convergence
+        #   optimizer_superparaboloid.zero_grad()
+
+        #   loss, p, distances = total_loss(points_centered, theta, p0, 0.0, sigma2, number_of_rays, number_samples_per_ray, current_ray_samples_flat, k)
+
+        #   loss_per_iteration.append(loss.item())  # Save it for plotting later
+        #   loss.backward()
+        #   optimizer_superparaboloid.step()
+
+        #   # Clamp theta values to stay valid
+        #   with torch.no_grad():
+              
+        #       iter_sigma+=1
+              
+
+        #       if iter_sigma == 10:
+        #           iter_sigma = 0
+        #           fitting_error = torch.sum(p*(distances)**2)
+                  
+        #           sigma2_new = 2 * torch.sum(p * distances**2) / (3 * torch.sum(p) + 1e-8)
+        #           sigma2 = 0.8 *sigma2+0.2*sigma2_new
+                  
+        #           print("sigma2: ", sigma2)
+
+                  
+        #       # Clamp e1 and e2 between [0.1, 2.0]
+        #       theta[0].clamp_(0.01, 2.0)  # e1
+        #       theta[1].clamp_(0.01, 2.0)  # e2
+              
+        #       # Clamp semi-axes a1, a2, a3 to be positive
+        #       theta[2:5].clamp_(0.001,1.5)  # a1, a2, a3 positive
+              
+        #       # Optionally clamp rotation angles between [-pi, pi]
+        #       theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
+              
+              
+              
+              
+        #   if step % 100 == 0:
+        #       print(f"Step {step}: Loss = {loss.item()}")
+        # print(theta)
+        # # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+        # theta_np = theta.detach().cpu().numpy()
+        # theta = theta.clone()  # (optional if you're not sure)
+        # theta[8:11] = theta[8:11] + t0
+        # theta_np = theta.detach().cpu().numpy()
+        # k_np = k.detach().cpu().numpy()
+
+      
+        # thetas = torch.tensor(theta_np, dtype=torch.float32, device='cuda')  # or 'cpu' if no GPU
+        # # Roti = build_rotation_matrix(thetas[5:8])
+        # # print("Roti: ", Roti)
+        
+        # points_centered_np = points_centered.detach().cpu().numpy()
+        # # print(p)
+        # p = torch.clamp(p, max=1.0)
+        
+        # indices = torch.nonzero(p > 0.9, as_tuple=False).view(-1)        
+        
+        # all_indices = np.arange(cluster.shape[0])
+        
+        # selected_indices_good = indices.cpu().numpy()
+        
+        # remaining_indices = np.setdiff1d(all_indices, selected_indices_good)
+        
+        # indices_bad = torch.nonzero(p <= 0.2, as_tuple=False).view(-1)
+        # print("indices  bad: ", indices_bad)
+        # selected_indices_bad = indices_bad.cpu().numpy()
+        # print("indices bad: ", selected_indices_bad)
+        # remaining_indices1 = np.setdiff1d(remaining_indices, selected_indices_bad)
+    
+        # all_params_modeled[i] = {"type": "superparaboloid", "theta": theta_np, "k": k_np}
+        # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+        # showPoints(cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
+        # if selected_indices_bad.size >0:
+        #     showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
+        # showPoints(cluster[remaining_indices1], scale_factor=0.01, color=(0,0,1))
+        # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
+        # showTaperedSuperparaboloidWithBase(theta_np, k_np)
+        # mlab.show()
