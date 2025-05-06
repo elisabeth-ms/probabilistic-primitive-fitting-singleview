@@ -9,15 +9,163 @@ import torch.nn.functional as F
 from sklearn.cluster import DBSCAN
 # from pytorch3d.structures import Pointclouds
 # from pytorch3d.ops import estimate_pointcloud_normals
+from matplotlib import cm
+
+from tvtk.api import tvtk
+from mayavi.sources.vtk_data_source import VTKDataSource
 
 
+def interpolate_color(val):
+    """
+    Map a value in [0,1] to a color along a custom dark gradient (no white).
+    Dark purple → blue → green → yellow → red
+    """
+    val = np.clip(val, 0, 1)
+    
+    if val < 0.25:
+        # Purple (0, 0, 0.5) → Blue (0, 0, 1)
+        t = val / 0.25
+        return (0, 0, 0.5 + 0.5 * t)
+    elif val < 0.5:
+        # Blue (0, 0, 1) → Green (0, 1, 0)
+        t = (val - 0.25) / 0.25
+        return (0, t, 1 - t)
+    elif val < 0.75:
+        # Green (0, 1, 0) → Yellow (1, 1, 0)
+        t = (val - 0.5) / 0.25
+        return (t, 1, 0)
+    else:
+        # Yellow (1, 1, 0) → Red (1, 0, 0)
+        t = (val - 0.75) / 0.25
+        return (1, 1 - t, 0)
+
+def show_points_colored(points, probs, scale_factor=0.02):
+    for i in range(len(points)):
+        color = interpolate_color(probs[i])
+        
+        # Generate values between 0 and 1
+
+        # Get corresponding colors from the Viridis colormap
+        color = cm.viridis(probs[i])[:3]
+        mlab.points3d(points[i, 0], points[i, 1], points[i, 2],
+                      scale_factor=scale_factor,
+                      color=color,
+                      mode='sphere')
+
+def show_points_manual_rgb(points, p, scale_factor=0.02):
+    """
+    Show 3D points with fully custom RGB colors (no LUTs).
+    p: array of values in [0, 1] controlling the color.
+    """
+    # Normalize and define color mapping: from purple (0) to yellow (1)
+    p = np.clip(p, 0.0, 1.0)
+    r = p
+    g = p
+    b = 1.0 - p
+    colors = np.vstack((r, g, b)).T
+
+    for i in range(len(points)):
+        val = p[i]
+        # Define your own RGB mapping here, e.g., purple (low) to yellow (high)
+        r = val
+        g = val
+        b = 1.0 - val
+        mlab.points3d(points[i, 0], points[i, 1], points[i, 2],
+                      scale_factor=scale_factor,
+                      color=(r, g, b),
+                      mode='sphere')  # Optional: '2dcircle', 'cube', etc.
+
+
+
+
+
+def show_points_with_custom_color(points, p, scale_factor=0.02):
+    """
+    Visualize 3D points colored by inlier probability p ∈ [0, 1],
+    where p = 0 is dark red and p = 1 is bright yellow.
+    """
+    # Ensure p is in [0, 1]
+    p = np.clip(p, 0.0, 1.0)
+
+    # Custom RGB mapping: e.g., from dark red → yellow
+    # You can adjust this mapping to suit your contrast needs
+    r = 1.0 * np.ones_like(p)
+    g = p  # increases with p
+    b = np.zeros_like(p)
+
+    # Stack into RGB array
+    colors = np.vstack((r, g, b)).T
+
+    mlab.figure(bgcolor=(1, 1, 1))  # white background
+
+    pts = mlab.points3d(
+        points[:, 0], points[:, 1], points[:, 2],
+        scale_factor=scale_factor,
+        color=(1, 1, 1),  # dummy color, overridden below
+        mode='sphere'
+    )
+
+    # Manually set per-point RGB colors
+    pts.glyph.scale_mode = 'scale_by_vector'
+    pts.module_manager.scalar_lut_manager.lut_mode = 'gray'  # disabled color map
+    pts.mlab_source.dataset.point_data.scalars = None
+    pts.mlab_source.dataset.point_data.vectors = colors
+    pts.mlab_source.dataset.modified()
 
 
 
 def showPoints(point, scale_factor=0.1, color =(1, 0, 0)):
     
-    mlab.view(azimuth=0.0, elevation=0.0, distance=2)
     mlab.points3d(point[:, 0], point[:, 1], point[:, 2], scale_factor=scale_factor, color=color)
+
+def custom_colormap_no_white(n=256):
+    # Use a perceptually uniform colormap like viridis or magma
+    base_cmap = cm.get_cmap('magma', n)  # Or 'viridis', 'plasma', etc.
+    return (base_cmap(np.linspace(0, 1, n)) * 255).astype(np.uint8)
+
+def lightgray_to_red_colormap(n=256):
+    reds = cm.get_cmap('Reds', n)(np.linspace(0, 1, n))
+    # Override low end to be light gray instead of white
+    reds[:10, :3] = [0.7, 0.7, 0.7]  # light gray
+    return (reds * 255).astype(np.uint8)
+
+def showBasedOnProbabilityPoints(points, p, scale_factor=0.1):
+    """
+    Show 3D points with a color gradient based on Z values.
+    """
+    mlab.view(azimuth=0.0, elevation=0.0, distance=2)
+
+
+    for pi in p:
+      if pi<0.05:
+        pi=0.05
+    
+    print("Min p:", p.min(), "Max p:", p.max())
+    print("Any NaNs?", np.isnan(p).any())
+    pts = mlab.points3d(
+        points[:, 0], points[:, 1], points[:, 2],
+        p,
+        scale_factor=scale_factor,
+        mode='sphere',
+        colormap='viridis', 
+    )
+    # Force LUT to cover the full scalar range manually
+    lut_manager = pts.module_manager.scalar_lut_manager
+    lut_manager.use_default_range = False
+    lut_manager.data_range = (0.0, 1.0)
+
+    # Optional: ensure opacity is 1 for all scalars
+    lut = lut_manager.lut.table.to_array()
+    lut[:, -1] = 255  # Set alpha to 255 (fully opaque)
+    lut_manager.lut.table = lut
+
+    # # Force the scalar lookup table to cover full range
+    # pts.module_manager.scalar_lut_manager.use_default_range = False
+    # pts.module_manager.scalar_lut_manager.data_range = (0.0, 1.0)
+    
+    # pts.module_manager.scalar_lut_manager.lut.table = custom_colormap_no_white()
+    mlab.colorbar(title='Inlier probability $p$', orientation='vertical')
+
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -38,7 +186,7 @@ def get_translation_numpy(theta_np):
     """
     return theta_np[8:11]
 
-def showTaperedSuperparaboloidWithBase(x, r_offset=0.01, threshold=1e-2, num_limit=10000, arclength=0.02):
+def showTaperedSuperparaboloidWithBase(x, r_offset=0.01, threshold=1e-2, num_limit=10000, arclength=0.02, color=(1.0, 0.5, 0.0)):
     import numpy as np
     from mayavi import mlab
 
@@ -79,8 +227,7 @@ def showTaperedSuperparaboloidWithBase(x, r_offset=0.01, threshold=1e-2, num_lim
             y_mesh[i, j] = point[1]
             z_mesh[i, j] = point[2]
 
-    mlab.mesh(x_mesh, y_mesh, z_mesh, color=(1.0, 0.2, 0.2), opacity=0.8)
-    mlab.view(azimuth=0.0, elevation=0.0, distance=2)
+    mlab.mesh(x_mesh, y_mesh, z_mesh, color=color, opacity=0.8)
 
 
 def showTaperedSuperparaboloid(x, kx=0.0, ky=0.0, threshold=1e-2, num_limit=10000, arclength=0.02):
@@ -184,7 +331,7 @@ def showSuperparaboloid(x, threshold=1e-2, num_limit=10000, arclength=0.02):
     mlab.view(azimuth=0.0, elevation=0.0, distance=2)
 
 
-def showSuperquadrics(x, threshold = 1e-2, num_limit = 10000, arclength = 0.02):
+def showSuperquadrics(x, threshold = 1e-2, num_limit = 10000, arclength = 0.02, color=(1, 0.5, 0)):
     # avoid numerical instability in sampling
     if x[0] < 0.007:
         x[0] = 0.007
@@ -211,8 +358,7 @@ def showSuperquadrics(x, threshold = 1e-2, num_limit = 10000, arclength = 0.02):
             y_mesh[m, n] = point_temp[1]
             z_mesh[m, n] = point_temp[2]
     
-    mlab.view(azimuth=0.0, elevation=0.0, distance=2)
-    mlab.mesh(x_mesh, y_mesh, z_mesh, color=(0, 0, 1), opacity=0.8)
+    mlab.mesh(x_mesh, y_mesh, z_mesh, color=color, opacity=1.0)
 
 
 
@@ -643,7 +789,7 @@ def initialize_theta_pytorch(points, rescale=True):
     s0 = torch.median(points_rot0.abs(), dim=0).values
 
     # 7. Initial parameters
-    e1 = torch.tensor(1.0, device=device)
+    e1 = torch.tensor(2.0, device=device)
     e2 = torch.tensor(1.0, device=device)
     a1, a2, a3 = s0[0], s0[1], s0[2]
 
@@ -804,7 +950,7 @@ def fitting_loss(points, theta, p0, sigma2, k):
 
     
     # Transform points
-    points_local = points @ Rot - t @ Rot
+    points_local = (points - t)@ Rot
     # Normalize by semi-axes
     x_ = points_local[:, 0] / a1
     y_ = points_local[:, 1] / a2
@@ -913,20 +1059,20 @@ def fitting_loss(points, theta, p0, sigma2, k):
     extent_penalty = overshoot ** 2 * penalty_weight
     # p = weights
     
-    allowed_margin = 0.01  # small tolerance below point cloud
+    allowed_margin = 0.02  # small tolerance below point cloud
     shape_base_z = t[2]
     min_z_points = points_local[:, 2].min()
 
-    drop_penalty = torch.relu(min_z_points - shape_base_z - allowed_margin) ** 2 * 20.0
+    drop_penalty = torch.relu(min_z_points - shape_base_z - allowed_margin) ** 2 * 10.0
     
     z_max = (z_vals).max()
     # print("z_max: ", z_max)
     # print("a3: ", a3)
-    extent_penalty = (a3-z_max) ** 2 * 10.0
+    extent_penalty = torch.relu(a3-z_max) ** 2 * 10.0
 
     # print("extent_penalty: ", extent_penalty)
 
-    return loss+z_penalty.sum() + drop_penalty+ extent_penalty, p, distances
+    return loss+1.0*z_penalty.sum() + drop_penalty+ extent_penalty, p, distances
 
 
 
@@ -939,14 +1085,14 @@ def superquadric_total_loss(points, theta, p0, weight_compactness, sigma2, numbe
     a1, a2, a3 = theta[2], theta[3], theta[4]
     rot = theta[5:8]  # Euler angles
     t = theta[8:11]   # translation vector
-    
+    print("theta: ", theta)
     # print("theta: ", theta)    
     # Build rotation matrix from Euler angles
     Rot = build_rotation_matrix(rot)
 
     
     # Transform points
-    points_local = points @ Rot - t @ Rot
+    points_local = points@Rot - t @ Rot
     # Normalize by semi-axes
     x_ = points_local[:, 0] / a1
     y_ = points_local[:, 1] / a2
@@ -956,6 +1102,7 @@ def superquadric_total_loss(points, theta, p0, weight_compactness, sigma2, numbe
     term2 = (torch.abs(z_)**(2/e1))
     inside_outside = term1 + term2
     
+    print("inside_outside: ", inside_outside)
     # inside_outside = (
     # (torch.abs(x_).pow(2/e2) + torch.abs(y_).pow(2/e2)).pow(e2/e1)
     # + torch.abs(z_).pow(2/e1))
@@ -966,7 +1113,7 @@ def superquadric_total_loss(points, theta, p0, weight_compactness, sigma2, numbe
     distances =  r_norm*torch.abs(inside_outside**(-e1/2)-1)
     
     c = (2 * torch.pi * sigma2) ** (- 3 / 2)
-    w=0.1
+    w=0.05
     const = (w * p0) / (c * (1 - w))
     
     dist_term = torch.exp(-1 / (2 * sigma2) * distances ** 2)
@@ -976,7 +1123,8 @@ def superquadric_total_loss(points, theta, p0, weight_compactness, sigma2, numbe
     p = dist_term / (const + dist_term)
     p = torch.clamp(p, min=1e-10)
     
-    # print("prob: ", p)
+    
+    print("prob: ", p)
     
     scaled_distances = distances
     
@@ -997,106 +1145,178 @@ def superquadric_total_loss(points, theta, p0, weight_compactness, sigma2, numbe
 
     
 
-    return fit_loss + 2.0*free_space_penalty, p, distances
+    return fit_loss + 1.0*free_space_penalty, p, distances
   
 
 
 
 def total_loss(points, theta, p0, weight_compactness, sigma2, number_of_rays, number_samples_per_ray, ray_samples_flat, k):
     fit, p, distances = fitting_loss(points, theta, p0, sigma2, k)
-    
-    # print("fit: ", fit)
-
-    
-    
-    # values = superquadric_function(ray_samples_flat, theta)
-    # print("values: ")
-    # inside = values < 1.0
-    # penalty = inside.float().sum() / len(ray_samples_flat)
-    
-    # print("samples: ", len(ray_samples_flat))
-    # print("inside: ", inside.float().sum())
-    # print("penaly1:", penalty)
-
-    # inside_score = superquadric_function(ray_samples_flat, theta)
-    # soft_inside = torch.sigmoid(-(inside_score - 1) * 10)  # sharpness ≈ 10–100
-    # # penalty = soft_inside.sum()    
-    # penalty = soft_inside.view(number_of_rays, -1).max(dim=1).values.mean()
-    # print("penalty: ", penalty)
-    # Reshape back to (N, S) and check if any point along ray is inside
-    # inside_any = inside.view(N, samples_per_ray).any(dim=1)  # (N,)
-    
-    # compact = compactness_loss(points, p, theta, weight_compactness)
-    # print("penalty: ", penalty)
-    
-    # loss += lambda_entropy * entropy_penalty
-
-    # f_vals = superquadric_function(ray_samples_flat, theta)  # shape (N * S,)
-    
-    # print("f_vals: ", f_vals)
-    
-    # print(torch.sum(f_vals < 1.0))
-    # print("N*S", number_of_rays*number_samples_per_ray)
-    
-    # # Detach to avoid autograd
-    # ray_samples_flat = ray_samples_flat.detach()
-
-    # # Evaluate superquadric function: returns (N*S,) values
-    # f_vals = superquadric_function(ray_samples_flat, theta)
-
-    # # Reshape back: (N, S)
-    # f_vals_per_ray = f_vals.view(number_of_rays, number_samples_per_ray)
-
-    # # Count number of points inside for each ray (f_val < 1)
-    # inside_mask = f_vals_per_ray < 1.0
-    # per_ray_inside_count = inside_mask.sum(dim=1)  # shape (N,)
-
-    # # Total or average, if needed
-    # total_inside = inside_mask.sum()
-    # average_inside_per_ray = per_ray_inside_count.float().mean()
-
-    # print("Total inside samples:", total_inside.item())
-    # print("Per-ray counts:", per_ray_inside_count)
-    # print("Average inside per ray:", average_inside_per_ray.item())
-    
-
 
     
 
     return fit, p, distances
   
-  
-  
-  
+
+
+# Plots for the shapes on the article
+
+# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# theta_box = [0.2, 0.2, 1.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# showSuperquadrics(theta_box)
+# theta_cylinder = [0.2, 1.0, 1.0, 1.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0]
+# showSuperquadrics(theta_cylinder)
+# theta_ellipsoid = [1.0, 1.0, 1.0, 1.0, 2.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0]
+# showSuperquadrics(theta_ellipsoid)
+# theta_octahedron = [2.0, 0.2, 1.0, 1.0, 2.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0]
+# showSuperquadrics(theta_octahedron)
+# mlab.show()
+
+fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+theta_1 = [2.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+r0_1 = 0.1
+showTaperedSuperparaboloidWithBase(theta_1, r0_1)
+
+# # theta_4 = [1.0, 1.8, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# # r0_4 = 0.1
+# # showTaperedSuperparaboloidWithBase(theta_4, r0_4)
+
+# theta_2 = [1.5, 1.0, 1.0, 1.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# r0_2 = 0.8
+# showTaperedSuperparaboloidWithBase(theta_2, r0_2)
+
+# theta_3 = [0.5, 1.2, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# r0_3 = 0.5
+# showTaperedSuperparaboloidWithBase(theta_3, r0_3)
+
+
+
+mlab.show()
 
 point_cloud = read_ply("data/objects7.ply")
-point_cloud = remove_close_points(point_cloud, 0.005)
+point_cloud = remove_close_points(point_cloud, 0.006)
 
 point_cloud = filter_by_z(point_cloud, -np.inf, 1.94)
 
 all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
 
 
+# def print_camera_view(scene):
+#     azimuth, elevation, distance, focalpoint = mlab.view()
+#     roll = mlab.roll()
+    
+#     print("Azimuth:", azimuth)
+#     print("Elevation:", elevation)
+#     print("Distance:", distance)
+#     print("Focal Point:", focalpoint)
+#     print("Roll:", roll)
+#     print("-" * 50)
+
+# @mlab.animate
+# def live_view_monitor():
+#     while True:
+#         print_camera_view(mlab.gcf())
+#         yield
+
+
 
 fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
-
-
-
-
+mlab.view(azimuth=-127, elevation=171, distance=1.26, focalpoint=(-0.04977768,0.06968273,0.79997664), roll=-178.84)
+showPoints(point_cloud, scale_factor=0.0025, color=(0.6,0.6,0.6))
+# live_view_monitor()
 # Lets plot the fitting 
 theta1 = [0.43085322,  0.3334181 ,  0.1755724 ,  0.04760716,  0.10751509,
         1.5580609 , -0.51621795, -1.2906431 ,  0.20583807, -0.04588583,
         0.7744524]
-showSuperquadrics(theta1)
+showSuperquadrics(theta1, color=(0.518, 0.780, 0.667))
+
+theta2 = [ 0.34291595,  0.46497834,  0.13244838,  0.03630781,  0.03517469,
+        1.5672905 , -0.5343182 , -1.9973316 , -0.16091624,  0.07729545,
+        0.67674136]
+showSuperquadrics(theta2,  color=(0.161, 0.431, 0.529))
+
+theta3 = [0.6378871 ,  0.6546559 ,  0.0380326 ,  0.01433728,  0.0123732 ,
+        -1.5435802 ,  0.53311396, -1.134063  , -0.16173   , -0.07120007,
+        0.59157586]
+showSuperquadrics(theta3,  color=(0.161, 0.431, 0.529))
+
+theta4 = [1.8046732 ,  1.1858393 ,  0.06681335,  0.07090971,  0.12584554,
+        1.5481961 ,  1.0237458 , -3.1111438 , -0.09766323,  0.062757  ,
+        0.92298627]
+k4=0.8
+showTaperedSuperparaboloidWithBase(theta4, k4, color=(1.0, 1.0, 0.169))
+
+theta5 = [0.39294407,  0.6082235 ,  0.01773949,  0.01672928,  0.04021339,
+        1.5518134 , -0.57437634, -1.8318247 ,  0.22142781,  0.05443245,
+        0.6215799]
+showSuperquadrics(theta5, color=(0.294, 0.071, 0.412))
+
+theta6 = [0.5046233 ,  0.8154403 ,  0.03351911,  0.02931844,  0.03654086,
+        1.0883882 , -0.36557555, -1.4172481 ,  0.21653208,  0.16831969,
+        0.6861477]
+showSuperquadrics(theta6,  color=(0.294, 0.071, 0.412))
+
+theta7 = [0.39621717,  0.41882688,  0.03269098,  0.00909346,  0.01354168,
+        -1.835317  ,  0.5494602 , -1.3893318 ,  0.22361767,  0.09255629,
+        0.6463623]
+showSuperquadrics(theta7,  color=(0.294, 0.071, 0.412))
+
+theta8= [0.43654877,  0.3062408 ,  0.04732962,  0.03263379,  0.03109895,
+        1.5629718 , -0.52601504,  1.3117464 , -0.06861866,  0.1902022 ,
+        0.568279]
+showSuperquadrics(theta8, color=(0.580, 0.847, 0.251))
+
+theta9 = [1.8730378 ,  1.0435834 ,  0.02369763,  0.0238652 ,  0.14368284,
+        1.5949976 ,  1.0735142 , -3.118101  ,  0.05201951,  0.20876324,
+        0.6709036]
+k9=0.8
+showTaperedSuperparaboloidWithBase(theta9, k9)
+
 mlab.show()
 
+blocks = [
+    [0.10146605, 0.08979341, 0.13970061, 0.03661494, 0.11091885, -1.56827101, 0.5124012, -1.84647234, 0.20674956, -0.07030025, 0.74962691],
+    [0.10156348, 0.40713203, 0.15034812, 0.03152425, 0.03357434, 1.57018739, -0.520114, 1.13127339, -0.16040713, 0.07441799, 0.67079592],
+    [0.92511971, 1.29361505, 0.07981475, 0.02545856, 0.02616961, 1.55060284, -0.5646786, -0.64815516, -0.16460688, -0.04343885, 0.61577923],
+    [0.98330942, 0.98392758, 0.10951403, 0.10619891, 0.10841419, -1.93637997, -0.79104754, -1.8518818, -0.10256101, -0.03034356, 0.86605207],
+    [0.03770605, 0.8767673, 0.07587676, 0.04367812, 0.04903468, 1.75918479, 0.09641413, -1.28667489, 0.18986037, 0.09976493, 0.64044212],
+    [0.16963001, 0.34912939, 0.01359951, 0.03792285, 0.07608895, 1.47430028, 1.01702226, -0.2084636, 0.21957674, 0.10073388, 0.65537968],
+    [0.99736174, 0.866563, 0.10277332, 0.0397981, 0.04076992, 1.5726279, -0.50088703, -1.33331975, 0.05181471, 0.09999471, 0.61220761],
+    [0.72178447, 0.09768885, 0.04682529, 0.04540695, 0.03527874, 1.56807535, -0.5197711, 1.40234277, -0.06979633, 0.18399139, 0.57851643]
+]
+
+fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+mlab.view(azimuth=-127, elevation=171, distance=1.26, focalpoint=(-0.04977768,0.06968273,0.79997664), roll=-178.84)
+showPoints(point_cloud, scale_factor=0.0025, color=(0.6,0.6,0.6))
+# live_view_monitor()
+# Lets plot the fitting 
+
+showSuperquadrics(blocks[0], color=(0.518, 0.780, 0.667))
 
 
+showSuperquadrics(blocks[1],  color=(0.161, 0.431, 0.529))
 
 
+showSuperquadrics(blocks[2],  color=(0.161, 0.431, 0.529))
 
-filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.005)
+
+showSuperquadrics(blocks[3], color=(1.0, 1.0, 0.169))
+
+
+showSuperquadrics(blocks[4], color=(0.294, 0.071, 0.412))
+
+
+showSuperquadrics(blocks[5],  color=(0.294, 0.071, 0.412))
+
+
+showSuperquadrics(blocks[6], color=(0.580, 0.847, 0.251))
+
+
+showSuperquadrics(blocks[7])
+
+mlab.show()
+
+filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.08)
 print("plane model: ", plane_model)
 
 table_normal = torch.tensor(plane_model[:3], dtype=torch.float32, device='cuda')
@@ -1106,7 +1326,7 @@ table_normal = torch.tensor(plane_model[:3], dtype=torch.float32, device='cuda')
 
 p= None
 kmeans = KMeans(n_clusters=4).fit(filtered_points)
-clustering = DBSCAN(eps=0.03, min_samples=6).fit(filtered_points)
+clustering = DBSCAN(eps=0.03, min_samples=3).fit(filtered_points)
 n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
 print(f"Number of clusters: {n_clusters}")
 
@@ -1227,7 +1447,7 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
     cos_angles = (cluster_vecs @ center_dir)
     max_angle = torch.acos(torch.clamp(cos_angles.min(), -1.0, 1.0))  # in radians
     
-    margin = 5 * torch.pi / 180  # radians
+    margin = 10 * torch.pi / 180  # radians
     final_cone_angle = max_angle + margin
     cos_thresh = torch.cos(final_cone_angle)
 
@@ -1243,15 +1463,23 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
     directions = points_in_cone - camera_origin  # or just points if origin is (0,0,0)
 
     # Now sample along these rays
-    number_samples_per_ray = 100
+    number_samples_per_ray = 200
     number_of_rays = points_in_cone.shape[0]
 
-    t_vals = torch.linspace(0.0, 0.95, number_samples_per_ray, device=points_in_cone.device)  # go slightly past the surface
+    t_vals = torch.linspace(0.2, 0.95, number_samples_per_ray, device=points_in_cone.device)  # go slightly past the surface
     ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
     
     print("len ray: ", ray_samples_flat.shape)
     
     current_ray_samples_flat = ray_points.reshape(-1, 3) - t0
+    
+    current_ray_samples_flat_np = current_ray_samples_flat.detach().cpu().numpy()
+
+    # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+    # showPoints(current_ray_samples_flat_np, scale_factor=0.001, color=(0,1,0))
+    # mlab.show()
+
+
     
     print("len ray: ", current_ray_samples_flat.shape)
 
@@ -1262,20 +1490,23 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
     iter_sigma = 0
 
     if superquadric:
-        optimizer = torch.optim.Adam([theta], lr=1e-3, weight_decay=0.001)
+        optimizer = torch.optim.Adam([theta], lr=1e-4, weight_decay=0.001)
 
         tolerance = 1e-6  # or something like 1e-4 depending on your scale
-        patience = 100     # number of steps with small change before stopping
+        patience = 100    # number of steps with small change before stopping
         no_improve_steps = 0
 
 
 
-        for step in range(5000):  # or until convergence
+        for step in range(1500):  # or until convergence
             optimizer.zero_grad()
 
             loss, p, distances = superquadric_total_loss(points_centered, theta, p0, 0.0, sigma2, number_of_rays, number_samples_per_ray, current_ray_samples_flat)
 
             loss_per_iteration.append(loss.item())  # Save it for plotting later
+            if not torch.isfinite(loss):
+                print(f"Loss became NaN at step {step}, stopping.")
+                break
             loss.backward()
             optimizer.step()
 
@@ -1286,16 +1517,16 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
                 iter_sigma+=1
                 
 
-                if iter_sigma == 10:
+                if iter_sigma == 15:
                     iter_sigma = 0
                     sigma2_new = 2 * torch.sum(p * distances**2) / (3 * torch.sum(p) + 1e-8)
-                    sigma2 = 0.7 *sigma2+0.3*sigma2_new
-                    
+                    sigma2 = 0.9 *sigma2+0.1*sigma2_new
+                    sigma2 = torch.clamp(sigma2, min=1e-8, max=1e2)                    
 
                     
                 # Clamp e1 and e2 between [0.1, 2.0]
-                theta[0].clamp_(0.001, 2.0)  # e1
-                theta[1].clamp_(0.001, 2.0)  # e2
+                theta[0].clamp_(0.01, 2.0)  # e1
+                theta[1].clamp_(0.01, 2.0)  # e2
                 
                 # Clamp semi-axes a1, a2, a3 to be positive
                 theta[2:5].clamp_(0.001,1.5)  # a1, a2, a3 positive
@@ -1304,7 +1535,15 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
                 theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
             if step>1:
                 loss_change = abs(loss_per_iteration[-1] - loss_per_iteration[-2])
-                if loss_change < tolerance:
+                if loss_change < tolerance:        # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+        # showPoints(current_cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
+        # if selected_indices_bad.size >0:
+        #     showPoints(current_cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
+        # showPoints(current_cluster[remaining_indices], scale_factor=0.01, color=(0,0,1))
+        # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
+        # showSuperquadrics(theta_np)
+        # mlab.show()
+        
                     no_improve_steps += 1
                 else:
                     no_improve_steps = 0
@@ -1316,6 +1555,8 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
                 
             if step % 100 == 0:
                 print(f"Step {step}: Loss = {loss.item()}")
+                
+                
         print(theta)
         theta_np = theta.detach().cpu().numpy()
         theta = theta.clone()  # (optional if you're not sure)
@@ -1326,7 +1567,7 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
         
         points_centered_np = points_centered.detach().cpu().numpy()
 
-        indices = torch.nonzero(p > 0.9, as_tuple=False).squeeze()
+        indices = torch.nonzero(p > 0.85, as_tuple=False).squeeze()
         
         all_indices = np.arange(cluster_points_np.shape[0])
         
@@ -1352,7 +1593,7 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
             number_samples_per_ray1 = 200
             number_of_rays1 = points[selected_indices_good].shape[0]
 
-            t_vals1 = torch.linspace(0, 0.96, number_samples_per_ray1, device=points.device)  # go slightly past the surface
+            t_vals1 = torch.linspace(0, 0.95, number_samples_per_ray1, device=points.device)  # go slightly past the surface
             ray_points1 = camera_origin1[:, None, :] + t_vals1[None, :, None] * directions1[:, None, :]
             ray_samples_flat1 = ray_points1.reshape(-1, 3)
 
@@ -1364,10 +1605,10 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
     else:
         points_centered,theta,_, p0, sigma2, t0 = initialize_theta_superparaboloids_pytorch(points, table_normal, False)
         optimizer_superparaboloid = torch.optim.Adam([theta], lr=1e-3, weight_decay=0.001)
-        k = torch.tensor(0.8)
+        k = torch.tensor(0.2)
         k = torch.nn.Parameter(k)
 
-        for step in range(1000):  # or until convergence
+        for step in range(1200):  # or until convergence
           optimizer_superparaboloid.zero_grad()
 
           loss, p, distances = total_loss(points_centered, theta, p0, 0.0, sigma2, number_of_rays, number_samples_per_ray, current_ray_samples_flat, k)
@@ -1393,8 +1634,8 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
 
                   
               # Clamp e1 and e2 between [0.1, 2.0]
-              theta[0].clamp_(0.1, 2.0)  # e1
-              theta[1].clamp_(0.1, 2.0)  # e2
+              theta[0].clamp_(0.01, 2.0)  # e1
+              theta[1].clamp_(0.01, 2.0)  # e2
               
               # Clamp semi-axes a1, a2, a3 to be positive
               theta[2:5].clamp_(0.001,1.5)  # a1, a2, a3 positive
@@ -1436,7 +1677,7 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
 
 
 
-    return theta_np,k_np, selected_indices_good,remaining_indices1, selected_indices_bad, free_space_penalty1
+    return theta_np,k_np, selected_indices_good,remaining_indices1, selected_indices_bad, free_space_penalty1, p
 
 
     # import matplotlib.pyplot as plt
@@ -1449,16 +1690,23 @@ def fit_shape_to_cluster(cluster_points_np, superquadric = True):
     # plt.show()
 all_params_modeled = {}
 idx = 0
-for i in range(5,6):
+for i in range(n_clusters):
     loss_per_iteration = []
     
     cluster = filtered_points[clustering.labels_ == i]
     current_cluster = cluster
-    while current_cluster.shape[0]>20:
-        theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty = fit_shape_to_cluster(current_cluster, True)
+    while current_cluster.shape[0]>40:
+        fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+        mlab.view(azimuth=-127, elevation=171, distance=1.26, focalpoint=(-0.04977768,0.06968273,0.79997664), roll=-178.84)
+        showPoints(current_cluster, scale_factor=0.0025, color=(0.6,0.6,0.6))
+        mlab.show()
+        
+        theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty,p = fit_shape_to_cluster(current_cluster, True)
         all_params_modeled[idx] = {"cluster": i,"type": "superquadric", "theta": theta_np, "k": 0, "free_space_penalty":free_space_penalty, "indices_good": selected_indices_good}
         idx +=1
         
+        p_np = p.detach().cpu().numpy()
+
         fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
         showPoints(current_cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
         if selected_indices_bad.size >0:
@@ -1467,6 +1715,13 @@ for i in range(5,6):
         showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
         showSuperquadrics(theta_np)
         mlab.show()
+        
+        # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+        # mlab.view(azimuth=-127, elevation=171, distance=1.26, focalpoint=(-0.04977768,0.06968273,0.79997664), roll=-178.84)
+        # show_points_colored(current_cluster,p_np, scale_factor=0.005)
+        # showPoints(point_cloud, scale_factor=0.0025, color=(0.6,0.6,0.6))
+        # showSuperquadrics(theta_np)
+        # mlab.show()
         
 
         # else:
@@ -1486,12 +1741,31 @@ for i in range(5,6):
         for id,params in all_params_modeled.items():
             if params["free_space_penalty"]>0.03:
               print("good: ",params["indices_good"])
-              theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad1, free_space_penalty = fit_shape_to_cluster(current_cluster[params["indices_good"]], False)
+              theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad1, free_space_penalty,p = fit_shape_to_cluster(current_cluster[params["indices_good"]], False)
               params["type"] = "superparabolid"
               params["theta"] = theta_np
               params["k"] = k_np
               params["free_space_penalty"]=0
+              # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+              # mlab.view(azimuth=-127, elevation=171, distance=1.26, focalpoint=(-0.04977768,0.06968273,0.79997664), roll=-178.84)
+              # show_points_colored(current_cluster,p_np, scale_factor=0.005)
+              # showPoints(point_cloud, scale_factor=0.0025, color=(0.6,0.6,0.6))
+              # showTaperedSuperparaboloidWithBase(theta_np,k_np)
+              # mlab.show()
         current_cluster = current_cluster[selected_indices_bad]
+        
+    print(all_params_modeled)
+    fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+    mlab.view(azimuth=-127, elevation=171, distance=1.26, focalpoint=(-0.04977768,0.06968273,0.79997664), roll=-178.84)
+
+    for idx,params in all_params_modeled.items():
+        if params["type"] == "superquadric":
+          showSuperquadrics(params['theta'])
+        else:
+          showTaperedSuperparaboloidWithBase(params['theta'], params['k'])
+    showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
+    mlab.show()
+
 
 #       showTaperedSuperparaboloidWithBase(params['theta'], params['k'])
 # showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
@@ -1502,6 +1776,7 @@ for i in range(5,6):
 print(all_params_modeled)
 
 fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+mlab.view(azimuth=-127, elevation=171, distance=1.26, focalpoint=(-0.04977768,0.06968273,0.79997664), roll=-178.84)
 for idx,params in all_params_modeled.items():
     if params["type"] == "superquadric":
       showSuperquadrics(params['theta'])
