@@ -1041,9 +1041,9 @@ def initialize_theta_pytorch(points, rescale=True):
     s0 = torch.median(points_rot0.abs(), dim=0).values
 
     # 7. Initial parameters
-    e1 = torch.tensor(0.2, device=device)
-    e2 = torch.tensor(1.0, device=device)
-    a1, a2, a3 = s0[0], s0[1], s0[2]
+    e1 = torch.tensor(1.0, device=device)
+    e2 = torch.tensor(1.5, device=device)
+    a1, a2, a3 = s0[0]/2.0, s0[1]/2.0, s0[2]/2.0
 
     print(a1, a2, a3)
     # 8. Get initial rotation as Euler angles
@@ -1545,185 +1545,8 @@ def superquadric_total_loss(points, theta, b, alpha, p0, weight_compactness, sig
 
 def total_loss(points, theta, p0, weight_compactness, sigma2, number_of_rays, number_samples_per_ray, ray_samples_flat, k, p):
     fit, _ , distances = fitting_loss(points, theta, p0, sigma2, k, p)
-    
-    # print("fit: ", fit)
-
-    
-    
-    # values = superquadric_function(ray_samples_flat, theta)
-    # print("values: ")
-    # inside = values < 1.0
-    # penalty = inside.float().sum() / len(ray_samples_flat)
-    
-    # print("samples: ", len(ray_samples_flat))
-    # print("inside: ", inside.float().sum())
-    # print("penaly1:", penalty)
-
-    # inside_score = superquadric_function(ray_samples_flat, theta)
-    # soft_inside = torch.sigmoid(-(inside_score - 1) * 10)  # sharpness ≈ 10–100
-    # # penalty = soft_inside.sum()    
-    # penalty = soft_inside.view(number_of_rays, -1).max(dim=1).values.mean()
-    # print("penalty: ", penalty)
-    # Reshape back to (N, S) and check if any point along ray is inside
-    # inside_any = inside.view(N, samples_per_ray).any(dim=1)  # (N,)
-    
-    # compact = compactness_loss(points, p, theta, weight_compactness)
-    # print("penalty: ", penalty)
-    
-    # loss += lambda_entropy * entropy_penalty
-
-    # f_vals = superquadric_function(ray_samples_flat, theta)  # shape (N * S,)
-    
-    # print("f_vals: ", f_vals)
-    
-    # print(torch.sum(f_vals < 1.0))
-    # print("N*S", number_of_rays*number_samples_per_ray)
-    
-    # # Detach to avoid autograd
-    # ray_samples_flat = ray_samples_flat.detach()
-
-    # # Evaluate superquadric function: returns (N*S,) values
-    # f_vals = superquadric_function(ray_samples_flat, theta)
-
-    # # Reshape back: (N, S)
-    # f_vals_per_ray = f_vals.view(number_of_rays, number_samples_per_ray)
-
-    # # Count number of points inside for each ray (f_val < 1)
-    # inside_mask = f_vals_per_ray < 1.0
-    # per_ray_inside_count = inside_mask.sum(dim=1)  # shape (N,)
-
-    # # Total or average, if needed
-    # total_inside = inside_mask.sum()
-    # average_inside_per_ray = per_ray_inside_count.float().mean()
-
-    # print("Total inside samples:", total_inside.item())
-    # print("Per-ray counts:", per_ray_inside_count)
-    # print("Average inside per ray:", average_inside_per_ray.item())
-    
-
-
-    
-
     return fit, p, distances
-  
-  
-  
 
-################ PARAMETERS ###############
-scene_ = "scene_27"
-N_ref_ = 1000
-base_lr_ = 1e-3
-T_ = 2000
-K_=3
-freeze_every_ = T_
-sigma_momentum_ = 0.0    # EMA for sigma2
-sigma_every_ = 1         # update cadence
-lambda_free_ = 120.0
-lambda_transverse_table_ = 10.0
-lambda_mass_ = 0.0
-w0_=0.05
-w_final_ = 0.35
-ramp_start_ = 0.7
-T_supertoroid_ = 1000
-lambda_free_supertoroid_ = 30.0
-lambda_transverse_table_supertoroid_ = 5.0
-
-T_superparaboloid_ = 3000
-number_samples_per_ray_ = 300
-weight_decay_ = 0.01
-
-params = {
-    "scene_": scene_,
-    "N_ref_": N_ref_,
-    "base_lr_": base_lr_,
-    "T_": T_,
-    "K_": K_,
-    "freeze_every_": freeze_every_,
-    "sigma_momentum_": sigma_momentum_,
-    "sigma_every_": sigma_every_,
-    "lambda_free_": lambda_free_,
-    "lambda_transverse_table_": lambda_transverse_table_,
-    "lambda_mass_": lambda_mass_,
-    "w0_": w0_,
-    "w_final_": w_final_,
-    "ramp_start_": ramp_start_,
-    "T_supertoroid_": T_supertoroid_,
-    "lambda_free_supertoroid_": lambda_free_supertoroid_,
-    "T_superparaboloid_": T_superparaboloid_,
-    "number_samples_per_ray_": number_samples_per_ray_,
-    "weight_decay_": weight_decay_,
-}
-
-base_path = "/home/elisabeth/repos/ProbabilisticSuperquadricFitting/results"
-
-scene_dir = Path(base_path) / scene_
-scene_dir.mkdir(parents=True, exist_ok=True)
-
-try:
-    test_n  # noqa: F821
-except NameError:
-    test_n = _next_test_num(scene_dir)
-    
-out_dir = scene_dir / f"test{test_n}"
-out_dir.mkdir(exist_ok=True)
-
-# --- write params once (won't overwrite if already present)
-params_path = out_dir / "params.yaml"
-if not params_path.exists():
-    run_params = {
-        "scene_": scene_,
-        "N_ref_": N_ref_,
-        "base_lr_": base_lr_,
-        "T_": T_,
-        "K_": K_,
-        "freeze_every_": freeze_every_,
-        "sigma_momentum_": sigma_momentum_,
-        "sigma_every_": sigma_every_,
-        "lambda_free_": lambda_free_,
-        "lambda_transverse_table_": lambda_transverse_table_,
-        "lambda_mass_": lambda_mass_,
-        "w0_": w0_,
-        "w_final_": w_final_,
-        "ramp_start_": ramp_start_,
-        "T_supertoroid_": T_supertoroid_,
-        "lambda_free_supertoroid_": lambda_free_supertoroid_,
-        "T_superparaboloid_": T_superparaboloid_,
-        "number_samples_per_ray_": number_samples_per_ray_,
-        "weight_decay_": weight_decay_,
-    }
-    params_path.write_text("# ################ PARAMETERS ###############\n" + _dump(run_params))
-
-
-# point_cloud = read_ply("data/objects7.ply")
-# point_cloud = remove_close_points(point_cloud, 0.005)
-
-# point_cloud = filter_by_z(point_cloud, -np.inf, 1.94)
-
-# all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
-
-
-
-# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-# showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
-
-point_cloud = read_with_open3d("data/sceneReplica/final_scenes/pcds/"+scene_+"/cloud.pcd")
-point_cloud = remove_close_points(point_cloud, 0.003)
-filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.003)
-filtered_points, plane_points1, plane_model1 = remove_largest_plane(filtered_points, distance_threshold=0.003)
-point_cloud = filter_by_z(point_cloud, -np.inf, 1.5)
-all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
-
-# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-# showPoints(filtered_points, scale_factor=0.0025, color=(0,0.5,0.5))
-# showPoints(np.array([[0,0,0]]))
-# mlab.show()
-
-
-
-
-print("plane model: ", plane_model)
-
-table_normal = torch.tensor(plane_model[:3], dtype=torch.float32, device='cuda')
 
 
 
@@ -1949,51 +1772,7 @@ def prune_clusters_like(clusters: Dict[int, np.ndarray],
     return cleaned, report
 
 
-# ---------------- Example ----------------
-# points_np: (N,3) from your /head_camera/depth_registered/points (same camera!)
-# seg_png: color segmentation aligned with that camera (same resolution)
-labels, id2color = load_seg_as_labels("data/sceneReplica/final_scenes/segmasks/"+scene_+"/gtseg_ord-nearest_first_step-0.png", inflate_px=20)
-point_labels = label_points_from_seg(filtered_points, labels)
-clusters = split_points_by_label(filtered_points, point_labels)
 
-# clusters_pruned, rep = prune_clusters_like(
-#     clusters,
-#     dbscan_min_samples=20,
-#     keep_quantile=0.98,
-#     min_points_after=30,
-#     gap_min=0.05,        # 5 cm gap to drop tiny islands
-#     rel_size_max=0.20    # drop components <20% of main if also far
-# )
-
-# for lab, r in rep.items():
-#     print(f"label {lab}: {r['orig']} -> {r['kept']} (dropped {r['dropped']})")
-
-# clusters = clusters_pruned
-print("clusters", clusters)
-# # clusters[k] is Nx3 for each object; id2color[k] gives its RGB color.
-
-# p= None
-# kmeans = KMeans(n_clusters=4).fit(filtered_points)
-# clustering = DBSCAN(eps=0.03, min_samples=6).fit(filtered_points)
-# n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
-# print(f"Number of clusters: {n_clusters}")
-
-camera_origin = torch.zeros_like(all_points)  # shape (N, 3), all (0,0,0)
-directions = all_points - camera_origin  # or just points if origin is (0,0,0)
-
-# Now sample along these rays
-number_samples_per_ray = 120
-number_of_rays = all_points.shape[0]
-
-t_vals = torch.linspace(0.03, 1.1, number_samples_per_ray, device=all_points.device)  # go slightly past the surface
-ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
-ray_samples_flat = ray_points.reshape(-1, 3)
-
-k = torch.tensor(0.6)
-k = torch.nn.Parameter(k)
-
-
-all_params_modeled = {}
 
 
 def fit_multiple_shape_to_clusters(clusters_points_np, label="root", depth=0, max_depth=3):
@@ -2221,59 +2000,6 @@ def sq_distances(points, theta):
     distances = r_norm * torch.abs(inside_outside**(-e1/2) - 1)
 
     return distances  # (N,) tensor
-
-# def sq_distances(points, theta, eps=1e-12):
-#     """
-#     Compute distances from points to the superquadric surface.
-#     This version is differentiable if called with grad enabled.
-#     """
-
-# # ----- unpack & precompute -----
-#     e1 = theta[0]
-#     e2 = theta[1]
-#     a1 = theta[2].abs().clamp_min(1e-6)
-#     a2 = theta[3].abs().clamp_min(1e-6)
-#     a3 = theta[4].abs().clamp_min(1e-6)
-
-#     inv_a1 = 1.0 / a1
-#     inv_a2 = 1.0 / a2
-#     inv_a3 = 1.0 / a3
-
-#     two_over_e2 = 2.0 / e2
-#     two_over_e1 = 2.0 / e1
-#     e2_over_e1  =  e2 / e1
-#     neg_e1_half = -0.5 * e1
-
-#     # ----- to local frame -----
-#     R = build_rotation_matrix(theta[5:8])  # must keep grad
-#     t = theta[8:11]
-#     t_local = t @ R
-#     points_local = points @ R - t_local  # (N,3)
-
-#     # ----- normalized coords -----
-#     x_ = points_local[:, 0] * inv_a1
-#     y_ = points_local[:, 1] * inv_a2
-#     z_ = points_local[:, 2] * inv_a3
-
-#     ax = x_.abs().clamp_min(eps)
-#     ay = y_.abs().clamp_min(eps)
-#     az = z_.abs().clamp_min(eps)
-
-#     # (|x|^(2/e2) + |y|^(2/e2))^(e2/e1) + |z|^(2/e1)
-#     x_term = ax.pow(two_over_e2)
-#     y_term = ay.pow(two_over_e2)
-#     xy_sum = x_term + y_term
-#     term1  = xy_sum.clamp_min(eps).pow(e2_over_e1)
-#     term2  = az.pow(two_over_e1)
-#     inside_outside = term1 + term2
-
-#     # distance = ||pl|| * | S^{-e1/2} - 1 |
-#     r_norm    = torch.linalg.norm(points_local, dim=1)
-#     inv_scale = inside_outside.clamp_min(eps).pow(neg_e1_half)
-#     distances = r_norm * (inv_scale - 1.0).abs()
-
-#     return distances
-
   
 def _spb_F_grad_local_smooth(P, theta, k, eps=1e-9, eps_relu=1e-6):
     # P in local frame
@@ -2335,42 +2061,6 @@ def spb_euclidean_distance(points, theta, k, iters=5, max_step=0.05):
     d = (Pl - S).norm(dim=1)
     return d
 
-# def spb_distances_classic(points, theta, k, eps=1e-12):
-#     # theta: [e1,e2,a1,a2,a3, rz,ry,rx, tx,ty,tz]
-#     e1, e2 = theta[0].abs().clamp_min(0.05), theta[1].abs().clamp_min(0.05)
-#     a1, a2, a3 = theta[2].abs().clamp_min(1e-6), theta[3].abs().clamp_min(1e-6), theta[4].abs().clamp_min(1e-6)
-#     R = build_rotation_matrix(theta[5:8])
-#     t = theta[8:11]
-#     k = torch.as_tensor(k, device=points.device, dtype=points.dtype).clamp_min(0.0)
-
-#     # to local: (points - t) @ R
-#     pl = (points - t) @ R
-#     x, y, z = pl[:,0], pl[:,1], pl[:,2]
-#     zplus = z.clamp_min(0.0)
-
-#     # implicit F
-#     u = (x.abs().clamp_min(eps)/a1).pow(2.0/e2) + (y.abs().clamp_min(eps)/a2).pow(2.0/e2)
-#     term_xy = u.clamp_min(eps).pow(e2/2.0)                   # ← NOTE: e2/2 (not e2/e1)
-#     term_z  = (zplus.clamp_min(eps)/a3).pow(1.0/e1)
-#     F = term_xy - term_z - k
-
-#     # gradient norm ||∇F||  (piecewise for z>0)
-#     du_dx = (2.0/e2) * (x.abs().clamp_min(eps)/a1).pow(2.0/e2 - 1.0) * x.sign() / a1
-#     du_dy = (2.0/e2) * (y.abs().clamp_min(eps)/a2).pow(2.0/e2 - 1.0) * y.sign() / a2
-#     coeff = (e2/2.0) * u.clamp_min(eps).pow(e2/2.0 - 1.0)
-#     d_termxy_dx = coeff * du_dx
-#     d_termxy_dy = coeff * du_dy
-
-#     d_termz_dz = torch.zeros_like(z)
-#     mask = z > 0
-#     if mask.any():
-#         d_termz_dz[mask] = (1.0/e1) * ( (zplus[mask].clamp_min(eps)/a3).pow(1.0/e1 - 1.0) ) * (1.0/a3)
-
-#     # ∇F = [d_termxy_dx, d_termxy_dy, -d_termz_dz]
-#     grad_norm = torch.sqrt(d_termxy_dx**2 + d_termxy_dy**2 + d_termz_dz**2).clamp_min(1e-9)
-
-#     d = F.abs() / grad_norm
-#     return d
 
 def spb_distances_classic(points, theta,k):
     # Assume points: (N, 3)
@@ -2411,71 +2101,6 @@ def spb_distances_classic(points, theta,k):
     
     return distances
 
-    
-# def st_distances(points, theta, eps=1e-6):
-#     """
-#     Approx. distance from points to a supertoroid surface (d>=0).
-#     Param order (matches your showSupertoroid): 
-#       e_eta, e_omega, Rmaj, a_r, a_z, rz, ry, rx, tx, ty, tz.
-
-#     Inside–outside model:
-#       r_ω = (|x|^{2/eω}+|y|^{2/eω})^{eω/2}               (Lp radius in XY)
-#       ρ   = r_ω - Rmaj                                   (radial offset to ring)
-#       G   = ( (|ρ|/a_r)^{2/eη} + (|z|/a_z)^{2/eη} )^{eη/2}  (2D superellipse norm)
-#       d  ≈ √(ρ^2+z^2) * | 1/G - 1 |                      (radial re-scaling, like sq)
-#     """
-#     # pose (same as your sq_distances)
-#     R = build_rotation_matrix(theta[5:8])
-#     t = theta[8:11]
-#     pts_local = points @ R - t @ R
-
-#     # parameters (robust clamps)
-#     eps_e = 0.05
-#     tiny  = 1e-9
-#     e_eta   = theta[0].abs().clamp_min(eps_e)
-#     e_omega = theta[1].abs().clamp_min(eps_e)
-#     Rmaj    = theta[2].abs().clamp_min(tiny)
-#     a_r     = theta[3].abs().clamp_min(tiny)
-#     a_z     = theta[4].abs().clamp_min(tiny)
-
-#     x = pts_local[:, 0]
-#     y = pts_local[:, 1]
-#     z = pts_local[:, 2]
-
-#     # Lp "radius" in XY controlled by e_omega (reduces to sqrt(x^2+y^2) when e_omega=1)
-#     p  = 2.0 / e_omega
-#     r_omega = (torch.abs(x).pow(p) + torch.abs(y).pow(p)).pow(1.0 / p)
-
-#     # radial offset to ring centerline and 2D superellipse in (ρ, z)
-#     rho = r_omega - Rmaj
-#     u = torch.abs(rho) / a_r
-#     v = torch.abs(z)   / a_z
-
-#     # superellipse "norm" in cross-section
-#     q = 2.0 / e_eta
-#     G = (u.pow(q) + v.pow(q)).pow(1.0 / q)        # equals 1 on the tube boundary
-
-#     # distance via radial rescaling in the (ρ,z) plane
-#     r_rz = torch.sqrt(rho * rho + z * z + tiny)
-#     d = r_rz * torch.abs((G.clamp_min(tiny)).reciprocal() - 1.0)
-    
-#     # ---- NEW: Taubin-style surrogate instead of radial rescale ----
-#     phi = G - 1.0  # value
-
-#     # grad wrt points (separate pass, detached in the denominator)
-#     pts = points.detach().requires_grad_(True)
-#     pl2 = pts @ R - t @ R
-#     x2, y2, z2 = pl2[:,0], pl2[:,1], pl2[:,2]
-#     r_xy2 = (x2.abs().pow(p) + y2.abs().pow(p)).pow(1.0/p)
-#     rho2  = r_xy2 - Rmaj
-#     G2    = ( (rho2.abs()/a_r).pow(q) + (z2.abs()/a_z).pow(q) ).pow(1.0/q)
-#     phi2  = G2 - 1.0
-
-#     g = torch.autograd.grad(phi2.sum(), pts, create_graph=False)[0]
-#     gradnorm = g.norm(dim=1).clamp_min(eps).detach()
-
-#     d = phi.abs() / gradnorm
-#     return d
 
 def st_distances(points, theta, eps=1e-6):
     """
@@ -3532,10 +3157,6 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
             print("After optimization checking rays: ", free_space_penalty1)
     elif shape == 'supertoroid':
         points_centered,theta,_, p0, sigma2, t0 = initialize_theta_supertoroid_pytorch(points, table_normal,False)
-        # points_centered,theta,_, p0, sigma2, t0 = initialize_theta_superparaboloids_pytorch(points, table_normal, False)
-        # k = torch.tensor(0.5)
-        # k = torch.nn.Parameter(k)
-        # optimizer_superparaboloid = torch.optim.Adam([theta,k], lr=1e-3, weight_decay=0.01)
         optimizer_supertoroid = torch.optim.Adam([theta], lr = lr, weight_decay=weight_decay_)
 
         for outer in range(T_supertoroid):
@@ -3683,55 +3304,13 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                 
                 # Optionally clamp rotation angles between [-pi, pi]
                 theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
-            # with torch.no_grad():
-            #     # 1) vecino más cercano (excluye el propio punto)
-            #     D = torch.cdist(points, points)                # (N,N) Euclídea en el MISMO frame que d/p
-            #     nbr = torch.topk(D, k=2, largest=False).indices[:, 1]  # vecino más cercano ≠ i
-
-            #     # 2) umbrales (ajústalos a tu escala)
-            #     dist_umbral = 0.006   # 2 mm: “misma zona”
-            #     prob_umbral = 0.30    # diferencia de probabilidad “grande”
-
-            #     # 3) máscara de casos sospechosos: muy cerca pero p muy distinta
-            #     bad = (torch.abs(d - d[nbr]) < dist_umbral) & (torch.abs(p - p[nbr]) > prob_umbral)
-            #     print("vecinos inconsistentes:", int(bad.sum()))
-
-            #     # 4) muestra algunos para inspección
-            #     idx_bad = torch.nonzero(bad, as_tuple=False).squeeze(1)[:20]
-            #     for i in idx_bad:
-            #         j = int(nbr[i])
-            #         print(f"i={int(i):5d}  j={j:5d}  |Δxyz={float(D[i,j]):.5f} "
-            #               f"| d=({float(d[i]):.5f},{float(d[j]):.5f}) "
-            #               f"| p=({float(p[i]):.4f},{float(p[j]):.4f}) "
-            #               f"| xi={tuple(points[i].tolist())}  xj={tuple(points[j].tolist())}")
-
-            # if outer % 50 == 0:
-            #     dump_topk_near(d, p, points_local=points_centered, k=50, name=f"SPB iter {outer}", exclude_zeros=True)
-            #     dump_topk_far(d, p, points_local=points_centered, k=200, name=f"SPB iter {outer}")
+                
         d = spb_distances_autograd(points_centered, theta, k)
-
-        # d = spb_min_distance_sampling(points_centered, theta, k,n_z=2000, n_omega=4000, pts_chunk=4096, surf_chunk=30000, no_grad=True)
-        # # d = spb_euclidean_distance(points_centered, theta, k, iters=50)
         distances_final = d.detach().cpu().numpy()
-        # c = (2 * torch.pi * sigma2) ** (- 3 / 2)
-        # w=0.5
-        # const = (w * p0) / (c * (1 - w))
-        # dist_term = torch.exp(-1 / (2 * sigma2) * d ** 2)
         
-        # # Final inlier probability with normal guidance
-        # p = dist_term / (const + dist_term)
-
-        # sigma2 = 2 * torch.sum(p * d**2) / (3 * torch.sum(p) + 1e-8)
-
-        # c = (2 * torch.pi * sigma2) ** (- 3 / 2)
-        # w=0.7
-        # const = (w * p0) / (c * (1 - w))
-        # dist_term = torch.exp(-1 / (2 * sigma2) * d ** 2)
-        # p = dist_term / (const + dist_term)
-
         dump_topk_near(d, p, points_local=points_centered, k=300, name=f"SPB iter {outer}", exclude_zeros=True)
         dump_topk_far(d, p, points_local=points_centered, k=300, name=f"SPB iter {outer}")
-
+        
         theta_np = theta.detach().cpu().numpy()
         theta = theta.clone()  # (optional if you're not sure)
         theta[8:11] = theta[8:11] + t0
@@ -3787,8 +3366,7 @@ def option1_score(d_squared, idx_inliers, N_total):
     # plt.title("Loss vs Iteration")
     # plt.grid(True)
     # plt.show()
-all_params_modeled = {}
-idx = 0
+
 # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
 # showPoints(filtered_points, scale_factor=0.005, color=(1,0,0))
 
@@ -3803,7 +3381,169 @@ idx = 0
 #     showPoints(current_cluster, scale_factor=0.01, color=(0,1,0))
 #     showPoints(filtered_points, scale_factor=0.005, color=(1,0,0))
 #     mlab.show()
+
+
+################ PARAMETERS ###############
+scene_ = "scene_39"
+N_ref_ = 1000
+base_lr_ = 1e-3
+T_ = 3000
+K_=3
+freeze_every_ = T_
+sigma_momentum_ = 0.0    # EMA for sigma2
+sigma_every_ = 1         # update cadence
+lambda_free_ = 120.0
+lambda_transverse_table_ = 10.0
+lambda_mass_ = 0.0
+w0_=0.05
+w_final_ = 0.35
+ramp_start_ = 0.7
+T_supertoroid_ = 1000
+lambda_free_supertoroid_ = 30.0
+lambda_transverse_table_supertoroid_ = 5.0
+
+T_superparaboloid_ = 4000
+number_samples_per_ray_ = 300
+weight_decay_ = 0.01
+
+params = {
+    "scene_": scene_,
+    "N_ref_": N_ref_,
+    "base_lr_": base_lr_,
+    "T_": T_,
+    "K_": K_,
+    "freeze_every_": freeze_every_,
+    "sigma_momentum_": sigma_momentum_,
+    "sigma_every_": sigma_every_,
+    "lambda_free_": lambda_free_,
+    "lambda_transverse_table_": lambda_transverse_table_,
+    "lambda_mass_": lambda_mass_,
+    "w0_": w0_,
+    "w_final_": w_final_,
+    "ramp_start_": ramp_start_,
+    "T_supertoroid_": T_supertoroid_,
+    "lambda_free_supertoroid_": lambda_free_supertoroid_,
+    "T_superparaboloid_": T_superparaboloid_,
+    "number_samples_per_ray_": number_samples_per_ray_,
+    "weight_decay_": weight_decay_,
+}
+
+base_path = "/home/elisabeth/repos/ProbabilisticSuperquadricFitting/results"
+
+scene_dir = Path(base_path) / scene_
+scene_dir.mkdir(parents=True, exist_ok=True)
+
+try:
+    test_n  # noqa: F821
+except NameError:
+    test_n = _next_test_num(scene_dir)
     
+out_dir = scene_dir / f"test{test_n}"
+out_dir.mkdir(exist_ok=True)
+
+# --- write params once (won't overwrite if already present)
+params_path = out_dir / "params.yaml"
+if not params_path.exists():
+    run_params = {
+        "scene_": scene_,
+        "N_ref_": N_ref_,
+        "base_lr_": base_lr_,
+        "T_": T_,
+        "K_": K_,
+        "freeze_every_": freeze_every_,
+        "sigma_momentum_": sigma_momentum_,
+        "sigma_every_": sigma_every_,
+        "lambda_free_": lambda_free_,
+        "lambda_transverse_table_": lambda_transverse_table_,
+        "lambda_mass_": lambda_mass_,
+        "w0_": w0_,
+        "w_final_": w_final_,
+        "ramp_start_": ramp_start_,
+        "T_supertoroid_": T_supertoroid_,
+        "lambda_free_supertoroid_": lambda_free_supertoroid_,
+        "T_superparaboloid_": T_superparaboloid_,
+        "number_samples_per_ray_": number_samples_per_ray_,
+        "weight_decay_": weight_decay_,
+    }
+    params_path.write_text("# ################ PARAMETERS ###############\n" + _dump(run_params))
+
+
+# point_cloud = read_ply("data/objects7.ply")
+# point_cloud = remove_close_points(point_cloud, 0.005)
+
+# point_cloud = filter_by_z(point_cloud, -np.inf, 1.94)
+
+# all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
+
+
+
+# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
+
+point_cloud = read_with_open3d("data/sceneReplica/final_scenes/pcds/"+scene_+"/cloud.pcd")
+point_cloud = remove_close_points(point_cloud, 0.003)
+filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.003)
+filtered_points, plane_points1, plane_model1 = remove_largest_plane(filtered_points, distance_threshold=0.003)
+point_cloud = filter_by_z(point_cloud, -np.inf, 1.5)
+all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
+
+# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# showPoints(filtered_points, scale_factor=0.0025, color=(0,0.5,0.5))
+# showPoints(np.array([[0,0,0]]))
+# mlab.show()
+
+
+
+
+print("plane model: ", plane_model)
+
+table_normal = torch.tensor(plane_model[:3], dtype=torch.float32, device='cuda')
+
+# points_np: (N,3) from your /head_camera/depth_registered/points (same camera!)
+# seg_png: color segmentation aligned with that camera (same resolution)
+labels, id2color = load_seg_as_labels("data/sceneReplica/final_scenes/segmasks/"+scene_+"/gtseg_ord-nearest_first_step-0.png", inflate_px=15)
+point_labels = label_points_from_seg(filtered_points, labels)
+clusters = split_points_by_label(filtered_points, point_labels)
+
+# clusters_pruned, rep = prune_clusters_like(
+#     clusters,
+#     dbscan_min_samples=20,
+#     keep_quantile=0.95,
+#     min_points_after=30,
+#     gap_min=0.01,        # 5 cm gap to drop tiny islands
+#     rel_size_max=0.30    # drop components <20% of main if also far
+# )
+
+# # for lab, r in rep.items():
+# #     print(f"label {lab}: {r['orig']} -> {r['kept']} (dropped {r['dropped']})")
+
+# clusters = clusters_pruned
+print("clusters", clusters)
+# # clusters[k] is Nx3 for each object; id2color[k] gives its RGB color.
+
+# p= None
+# kmeans = KMeans(n_clusters=4).fit(filtered_points)
+# clustering = DBSCAN(eps=0.03, min_samples=6).fit(filtered_points)
+# n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
+# print(f"Number of clusters: {n_clusters}")
+
+camera_origin = torch.zeros_like(all_points)  # shape (N, 3), all (0,0,0)
+directions = all_points - camera_origin  # or just points if origin is (0,0,0)
+
+# Now sample along these rays
+number_samples_per_ray = 120
+number_of_rays = all_points.shape[0]
+
+t_vals = torch.linspace(0.03, 1.1, number_samples_per_ray, device=all_points.device)  # go slightly past the surface
+ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
+ray_samples_flat = ray_points.reshape(-1, 3)
+
+k = torch.tensor(0.6)
+k = torch.nn.Parameter(k)
+
+
+all_params_modeled = {}
+idx = 0
 # for i in range(0, len(clusters)-1):
 for lid, cluster in clusters.items():
     print(lid, cluster.shape)                    # each pts is Nx3
@@ -4124,13 +3864,9 @@ def print_camera_view(fig):
 def _on_interaction(obj, evt):
     print_camera_view(fig)
 
-# less spammy: only at the end of the interaction
 def _on_end_interaction(obj, evt):
     print_camera_view(fig)
 
-
-
-# si ya se activó (según versión), engánchate ahora:
 
 print(all_params_modeled)
 
@@ -4154,90 +3890,3 @@ print_camera_view(fig)
 mlab.show()
 
 
-# if free_space_penalty1>0.1: #Probably is a open shape, lets model it using a superparaboloid
-#         print("lets try to model it using a superparaboloid")
-        # points_centered,theta,_, p0, sigma2, t0 = initialize_theta_superparaboloids_pytorch(points, table_normal, False)
-        # optimizer_superparaboloid = torch.optim.Adam([theta], lr=1e-3, weight_decay=0.001)
-        # k = torch.tensor(0.6)
-        # k = torch.nn.Parameter(k)
-
-        # for step in range(300):  # or until convergence
-        #   optimizer_superparaboloid.zero_grad()
-
-        #   loss, p, distances = total_loss(points_centered, theta, p0, 0.0, sigma2, number_of_rays, number_samples_per_ray, current_ray_samples_flat, k)
-
-        #   loss_per_iteration.append(loss.item())  # Save it for plotting later
-        #   loss.backward()
-        #   optimizer_superparaboloid.step()
-
-        #   # Clamp theta values to stay valid
-        #   with torch.no_grad():
-              
-        #       iter_sigma+=1
-              
-
-        #       if iter_sigma == 10:
-        #           iter_sigma = 0
-        #           fitting_error = torch.sum(p*(distances)**2)
-                  
-        #           sigma2_new = 2 * torch.sum(p * distances**2) / (3 * torch.sum(p) + 1e-8)
-        #           sigma2 = 0.8 *sigma2+0.2*sigma2_new
-                  
-        #           print("sigma2: ", sigma2)
-
-                  
-        #       # Clamp e1 and e2 between [0.1, 2.0]
-        #       theta[0].clamp_(0.01, 2.0)  # e1
-        #       theta[1].clamp_(0.01, 2.0)  # e2
-              
-        #       # Clamp semi-axes a1, a2, a3 to be positive
-        #       theta[2:5].clamp_(0.001,1.5)  # a1, a2, a3 positive
-              
-        #       # Optionally clamp rotation angles between [-pi, pi]
-        #       theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
-              
-              
-              
-              
-        #   if step % 100 == 0:
-        #       print(f"Step {step}: Loss = {loss.item()}")
-        # print(theta)
-        # # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-        # theta_np = theta.detach().cpu().numpy()
-        # theta = theta.clone()  # (optional if you're not sure)
-        # theta[8:11] = theta[8:11] + t0
-        # theta_np = theta.detach().cpu().numpy()
-        # k_np = k.detach().cpu().numpy()
-
-      
-        # thetas = torch.tensor(theta_np, dtype=torch.float32, device='cuda')  # or 'cpu' if no GPU
-        # # Roti = build_rotation_matrix(thetas[5:8])
-        # # print("Roti: ", Roti)
-        
-        # points_centered_np = points_centered.detach().cpu().numpy()
-        # # print(p)
-        # p = torch.clamp(p, max=1.0)
-        
-        # indices = torch.nonzero(p > 0.9, as_tuple=False).view(-1)        
-        
-        # all_indices = np.arange(cluster.shape[0])
-        
-        # selected_indices_good = indices.cpu().numpy()
-        
-        # remaining_indices = np.setdiff1d(all_indices, selected_indices_good)
-        
-        # indices_bad = torch.nonzero(p <= 0.2, as_tuple=False).view(-1)
-        # print("indices  bad: ", indices_bad)
-        # selected_indices_bad = indices_bad.cpu().numpy()
-        # print("indices bad: ", selected_indices_bad)
-        # remaining_indices1 = np.setdiff1d(remaining_indices, selected_indices_bad)
-    
-        # all_params_modeled[i] = {"type": "superparaboloid", "theta": theta_np, "k": k_np}
-        # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-        # showPoints(cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
-        # if selected_indices_bad.size >0:
-        #     showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
-        # showPoints(cluster[remaining_indices1], scale_factor=0.01, color=(0,0,1))
-        # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
-        # showTaperedSuperparaboloidWithBase(theta_np, k_np)
-        # mlab.show()
