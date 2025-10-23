@@ -1,719 +1,550 @@
 from __future__ import annotations
+
 from pathlib import Path
-import re
-import numpy as np
-import open3d as o3d
-from mayavi import mlab
-import cv2
+
 from sklearn.cluster import DBSCAN
 import open3d as o3d
-from scipy.spatial import cKDTree
-from scipy.spatial.transform import Rotation as R
 from collections import defaultdict
 import re, datetime as dt
-import yaml
-from pathlib import Path
-from typing import Dict, Any, List, Union
 import re, yaml, numpy as np
 import torch
+from mayavi import mlab
+import plot_functions
+import tools
 
-def _next_test_num(scene_dir: Path) -> int:
-    mx = 0
-    pat = re.compile(r"^test(\d+)$")
-    for p in scene_dir.iterdir():
-        if p.is_dir():
-            m = pat.match(p.name)
-            if m: mx = max(mx, int(m.group(1)))
-    return mx + 1
+import torch
+import math
+
+import numpy as np;
+from typing import Tuple, Dict
+
+
+
+
+def to_world(points_local, R, t):
+    # world = local @ R + t
+    return points_local @ R + t
+
+# --- small helpers ---
+def _signed_pow(x, p, eps=1e-12):
+    # sign(x) * |x|^p, safe at 0
+    return torch.sign(x) * torch.pow(torch.clamp(torch.abs(x), min=eps), p)
+
+def _cos(x): 
+  return torch.cos(x)
+
+def _sin(x): 
+  return torch.sin(x)
+
+def superellipsoid_param_to_local(eta, omega, a, eps1, eps2):
+    # Using standard param eq with signed powers of cos/sin
+    c_eta = _cos(eta); s_eta = _sin(eta)
+    c_om  = _cos(omega); s_om  = _sin(omega)
+
+    x = a[0] * _signed_pow(c_eta, eps1/2.0) * _signed_pow(c_om, eps2/2.0)
+    y = a[1] * _signed_pow(c_eta, eps1/2.0) * _signed_pow(s_om, eps2/2.0)
+    z = a[2] * _signed_pow(s_eta, eps1/2.0)
+    return torch.stack([x,y,z], dim=-1)  # (...,3)
   
-def read_with_open3d(path: str) -> np.ndarray:
-    pcd = o3d.io.read_point_cloud(path)
-    pts = np.asarray(pcd.points, dtype=np.float32)
-    return pts
 
-def remove_close_points(points, min_dist=0.01):
+# @torch.no_grad()
+# def nearest_on_superquadric(
+#     points_world: torch.Tensor,   # (N,3) float32, same device for best speed
+#     samples_world: torch.Tensor,  # (K,3) float32, sampled points from THIS superquadric
+# ):
+#     """
+#     Returns:
+#       dmin : (N,)   nearest distance from each point to this superquadric's samples
+#       idx  : (N,)   index into samples_world of the nearest sample for each point
+#       qmin : (N,3)  the nearest sampled point coords (world) for each point
+#     """
+#     # Pairwise distances N x K
+#     D = torch.cdist(points_world, samples_world, p=2)   # (N, K)
+
+#     # Nearest per point
+#     dmin, idx = D.min(dim=1)                            # (N,), (N,)
+#     qmin = samples_world[idx]                           # (N,3)
+#     return dmin, idx, qmin
+
+  
+
+  
+
+
+import numpy as np
+
+# ---------- SE(3) helpers ----------
+def quat_to_R(qx, qy, qz, qw):
+    q = np.array([qx, qy, qz, qw], dtype=np.float64)
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        return np.eye(3)
+    q /= n
+    x, y, z, w = q
+    xx, yy, zz = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+    return np.array([
+        [1-2*(yy+zz), 2*(xy-wz),   2*(xz+wy)],
+        [2*(xy+wz),   1-2*(xx+zz), 2*(yz-wx)],
+        [2*(xz-wy),   2*(yz+wx),   1-2*(xx+yy)]
+    ], dtype=np.float64)
+
+def pose7_to_T(pose7):
+    """pose7: [tx,ty,tz,qx,qy,qz,qw]  ->  4x4 T (world<-frame)"""
+    tx, ty, tz, qx, qy, qz, qw = [float(v) for v in pose7]
+    R = quat_to_R(qx, qy, qz, qw)
+    T = np.eye(4, dtype=np.float64)
+    T[:3,:3] = R
+    T[:3, 3] = [tx, ty, tz]
+    return T
+
+def T_inv(T):
+    R, t = T[:3,:3], T[:3,3]
+    Ti = np.eye(4, dtype=np.float64)
+    Ti[:3,:3] = R.T
+    Ti[:3, 3] = -R.T @ t
+    return Ti
+
+def apply_T_points_normals(points, normals, T):
+    R, t = T[:3,:3], T[:3,3]
+    Pw = points @ R.T + t
+    Nw = None if normals is None else (normals @ R.T)
+    if Nw is not None:
+        Nw /= (np.linalg.norm(Nw, axis=1, keepdims=True) + 1e-12)
+    return Pw, Nw
+
+# ---------- world -> camera conversion ----------
+def object_pose_in_camera(T_w_o, pose7_cam_world):
     """
-    Removes points that are closer than min_dist to each other.
-
-    Parameters:
-        points (np.ndarray): Nx3 array of 3D points.
-        min_dist (float): minimum allowed distance between any two points.
-
-    Returns:
-        np.ndarray: Filtered points.
+    T_w_o: 4x4 pose of object in world (world<-object)
+    pose7_cam_world: [tx,ty,tz,qx,qy,qz,qw] of CAMERA in world (world<-camera)
+    Returns: T_c_o (camera<-object)
     """
-    tree = cKDTree(points)
-    mask = np.ones(len(points), dtype=bool)
+    T_w_c = pose7_to_T(pose7_cam_world)   # world <- camera
+    T_c_w = T_inv(T_w_c)                  # camera <- world
+    T_c_o = T_c_w @ T_w_o                 # camera <- object
+    return T_c_o
 
-    for i in range(len(points)):
-        if not mask[i]:
-            continue
-        # Find neighbors within min_dist (excluding self)
-        indices = tree.query_ball_point(points[i], r=min_dist)
-        indices = [j for j in indices if j > i]
-        mask[indices] = False  # Mark close duplicates for removal
-
-    return points[mask]
-
-def remove_largest_plane(points_np, distance_threshold=0.01, ransac_n=3, num_iterations=1000):
+# ---------- main convenience ----------
+def transform_obj_cloud_into_camera(points_obj, normals_obj, T_c_o):
     """
-    Removes the largest plane (e.g., a flat table) from a point cloud using RANSAC.
-
-    Args:
-        points_np (np.ndarray): Nx3 numpy array of points.
-        distance_threshold (float): Max distance from the plane to consider as inlier.
-        ransac_n (int): Number of points to sample per RANSAC iteration.
-        num_iterations (int): Number of RANSAC iterations.
-
-    Returns:
-        np.ndarray: Point cloud with the largest plane removed.
-        np.ndarray: Points on the plane (optional, for visualization/debugging).
+    points_obj/normals_obj: OBJ cloud in object canonical frame (Nx3)
+    pose7_obj_world: object pose in world [tx,ty,tz,qx,qy,qz,qw]
+    pose7_cam_world: camera pose in world [tx,ty,tz,qx,qy,qz,qw]  (e.g., head_camera_rgb_optical_frame)
+    Returns: points_cam, normals_cam  (cloud in camera frame)
     """
-    # # Convert to Open3D PointCloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_np)
+    pts_c, nrm_c = apply_T_points_normals(points_obj, normals_obj, T_c_o)
+    return pts_c, nrm_c
 
-    # Fit plane using RANSAC
-    plane_model, inliers = pcd.segment_plane(distance_threshold=distance_threshold, ransac_n=ransac_n, num_iterations=num_iterations)
+# --- utilities ---
+def np_to_pcd(pts: np.ndarray) -> o3d.geometry.PointCloud:
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=np.float64))
+    return pc
 
-    # Separate inliers (plane) and outliers (rest)
-    plane_cloud = pcd.select_by_index(inliers)
-    remaining_cloud = pcd.select_by_index(inliers, invert=True)
-
-    # Convert back to numpy
-    remaining_points = np.asarray(remaining_cloud.points)
-    plane_points = np.asarray(plane_cloud.points)
-
-    return remaining_points, plane_points, plane_model
-
-def filter_by_z(points, z_min=-np.inf, z_max=np.inf):
+def auto_voxel(pts: np.ndarray) -> float:
     """
-    Removes points with Z outside the specified range.
-
-    Args:
-        points (np.ndarray): Nx3 array of points.
-        z_min (float): Minimum allowed Z value.
-        z_max (float): Maximum allowed Z value.
-
-    Returns:
-        np.ndarray: Filtered point cloud.
+    Pick a voxel ~ median NN distance (clamped).
+    Works better than fixed voxel when density varies.
     """
-    z = points[:, 2]
-    mask = (z >= z_min) & (z <= z_max)
-    return points[mask]
+    if pts.shape[0] < 200:
+        # sparse: use bbox-based heuristic
+        diag = np.linalg.norm(pts.max(0) - pts.min(0))
+        return max(0.0002, min(0.05, diag / 150.0))
+    # fast kNN on a tiny subsample
+    pcd = np_to_pcd(pts[np.random.choice(pts.shape[0], min(4000, pts.shape[0]), replace=False)])
+    kdt = o3d.geometry.KDTreeFlann(pcd)
+    dists = []
+    for i in range(min(1000, len(pcd.points))):
+        _, idx, _ = kdt.search_knn_vector_3d(pcd.points[i], 2)
+        if len(idx) == 2:
+            d = np.linalg.norm(np.asarray(pcd.points[i]) - np.asarray(pcd.points[idx[1]]))
+            dists.append(d)
+    med = np.median(dists) if dists else 0.01
+    return float(max(0.0002, min(0.05, med)))  # clamp to 2–50 mm
 
-def _inflate_into_background(labels: np.ndarray, radius_px: int) -> np.ndarray:
-    """
-    Expand each label up to radius_px pixels into background (-1) only.
-    Uses nearest-label assignment (no order bias, no crossing into other labels).
-    """
-    if radius_px <= 0:
-        return labels
 
+
+# ---------- helpers ----------
+def np_to_pcd(pts: np.ndarray) -> o3d.geometry.PointCloud:
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=np.float64))
+    return pc
+
+def auto_voxel(pts: np.ndarray) -> float:
+    """Pick a voxel ~ median NN distance (clamped). Works when density varies."""
+    if pts.shape[0] < 200:
+        diag = np.linalg.norm(pts.max(0) - pts.min(0))
+        return max(0.002, min(0.05, diag / 150.0))
+    pcd = np_to_pcd(pts[np.random.choice(pts.shape[0], min(4000, pts.shape[0]), replace=False)])
+    kdt = o3d.geometry.KDTreeFlann(pcd)
+    dists = []
+    upper = min(1000, len(pcd.points))
+    for i in range(upper):
+        _, idx, _ = kdt.search_knn_vector_3d(pcd.points[i], 2)
+        if len(idx) == 2:
+            d = np.linalg.norm(np.asarray(pcd.points[i]) - np.asarray(pcd.points[idx[1]]))
+            dists.append(d)
+    med = np.median(dists) if dists else 0.01
+    return float(max(0.002, min(0.05, med)))  # clamp to 2–50 mm
+
+def preprocess(pc: o3d.geometry.PointCloud, voxel: float, radius_factor=4.0, max_nn=60):
+    p = pc.voxel_down_sample(voxel)
+    if len(p.points) < 30:
+        return pc  # too sparse → skip downsampling and normals here
+    p.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel*radius_factor, max_nn=max_nn))
     try:
-        from scipy.ndimage import distance_transform_edt
+        p.orient_normals_consistent_tangent_plane(50)
     except Exception:
-        raise RuntimeError("scipy is required for inflate_px. Install with: pip install scipy")
+        pass
+    return p
 
-    fg = labels >= 0               # foreground (labeled)
-    bg = ~fg                       # background (== -1)
+def ensure_normals(pcd: o3d.geometry.PointCloud, radius: float, max_nn: int = 120) -> bool:
+    if len(pcd.points) < 30:
+        return False
+    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max_nn))
+    try:
+        pcd.orient_normals_consistent_tangent_plane(50)
+    except Exception:
+        pass
+    return pcd.has_normals()
 
-    if not np.any(bg):
-        return labels.copy()
-
-    # Distance from each background pixel to the nearest foreground pixel,
-    # plus the indices (row,col) of that nearest foreground pixel.
-    dist, idx = distance_transform_edt(bg, return_indices=True)
-
-    # For each pixel, nearest foreground coordinates:
-    rr, cc = idx[0], idx[1]
-    nearest_lab = labels[rr, cc]
-
-    out = labels.copy()
-    # Fill only background pixels within radius with the nearest label
-    fill = bg & (dist <= float(radius_px))
-    out[fill] = nearest_lab[fill]
-    return out
-
-def load_seg_as_labels(seg_png_path, bg_colors=[(0,0,0)], inflate_px: int = 0):
+# ---------- main ----------
+def icp_point_to_plane_adaptive(src_pts: np.ndarray,
+                                tgt_pts: np.ndarray,
+                                T_init=np.eye(4)):
     """
-    Reads a color segmentation PNG and returns:
-      labels (H,W) int32 with -1 for background,
-      id2color: dict[label_id] = (R,G,B)
-    Optional: inflate_px grows labels into background by N pixels.
+    Adaptive multi-scale ICP with finer voxels and a final full-res pass.
+    Returns: (T_refined [4x4], info [6x6])
     """
-    seg_bgr = cv2.imread(seg_png_path, cv2.IMREAD_COLOR)
-    if seg_bgr is None:
-        raise FileNotFoundError(seg_png_path)
-    seg = cv2.cvtColor(seg_bgr, cv2.COLOR_BGR2RGB)
-    H, W, _ = seg.shape
+    assert src_pts.ndim == 2 and src_pts.shape[1] == 3
+    assert tgt_pts.ndim == 2 and tgt_pts.shape[1] == 3
+    if len(src_pts) < 10 or len(tgt_pts) < 10:
+        raise ValueError("Not enough points for ICP.")
 
-    rgb = seg.reshape(-1,3).astype(np.int32)
-    col_hash = (rgb[:,0] << 16) | (rgb[:,1] << 8) | rgb[:,2]
-    uniq, inv = np.unique(col_hash, return_inverse=True)
-    labels = inv.reshape(H, W).astype(np.int32)
+    base = 0.5 * (auto_voxel(src_pts) + auto_voxel(tgt_pts))
 
-    id2color = {i: ((c>>16)&255, (c>>8)&255, c&255) for i, c in enumerate(uniq)}
-    bg_hashes = {(r<<16)|(g<<8)|b for (r,g,b) in bg_colors}
-    bg_ids = {i for i, c in enumerate(uniq) if c in bg_hashes}
-    if bg_ids:
-        labels[np.isin(labels, list(bg_ids))] = -1
+    # --- finer pyramid (more resolution) ---
+    voxels = [base*1.25, base*0.7, max(base*0.4, 0.0015)]  # last ≈ very fine
+    voxels = [float(max(0.001, min(0.03, v))) for v in voxels]  # clamp: 1–30 mm
 
-    # Inflate a bit into background (if requested)
-    if inflate_px > 0:
-        labels = _inflate_into_background(labels, inflate_px)
+    # per-level normal neighborhoods (bigger at fine scale)
+    normal_radius_factor = (3.5, 5.0, 7.0)
+    max_nn_levels = (40, 70, 90)
 
-    return labels, id2color
+    # tighter correspondence per level
+    mcd_mul = (2.0, 1.5, 1.2)
+    iters = (80, 60, 50)
 
-# --- Intrinsics (yours) ---
+    src = np_to_pcd(src_pts)
+    tgt = np_to_pcd(tgt_pts)
+
+    T = T_init.copy()
+
+    for lvl, (vox, rfac, nn, mul, nit) in enumerate(
+        zip(voxels, normal_radius_factor, max_nn_levels, mcd_mul, iters), 1
+    ):
+        src_ds = preprocess(src, vox, rfac, nn)
+        tgt_ds = preprocess(tgt, vox, rfac, nn)
+
+        # Prefer point-to-plane; fall back if normals missing
+        use_p2plane = src_ds.has_normals() and tgt_ds.has_normals() and \
+                      len(src_ds.points) >= 30 and len(tgt_ds.points) >= 30
+        if use_p2plane:
+            try:
+                rk = o3d.pipelines.registration.RobustKernel(
+                    o3d.pipelines.registration.RobustKernelType.Tukey, 4.685
+                )
+                est = o3d.pipelines.registration.TransformationEstimationPointToPlane(rk)
+            except Exception:
+                est = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+            mode = "p2plane"
+        else:
+            est = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+            mode = "p2point"
+
+        max_corr = mul * vox
+        reg = o3d.pipelines.registration.registration_icp(
+            src_ds, tgt_ds, max_corr, T, est,
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=nit),
+        )
+        T = reg.transformation
+        print(f"[L{lvl}] voxel={vox:.4f} thr={max_corr:.4f}  fitness={reg.fitness:.3f} "
+              f"rmse={reg.inlier_rmse:.5f} mode={mode}")
+
+    # --- ultra-fine final pass on full-resolution clouds ---
+    final_thresh = max(0.0015, 0.8 * voxels[-1])  # ~1–2 mm typical
+    # ensure normals on target for point-to-plane; if not possible, fall back
+    norm_radius = max(final_thresh * 8.0, 0.006)  # generous neighborhood
+    tgt_has = ensure_normals(tgt, norm_radius, max_nn=150)
+    src_has = ensure_normals(src, norm_radius, max_nn=150)
+
+    if tgt_has:
+        est_final = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        final_mode = "p2plane"
+    else:
+        est_final = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+        final_mode = "p2point"
+
+    reg_final = o3d.pipelines.registration.registration_icp(
+        src, tgt, final_thresh, T, est_final,
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
+    )
+    T = reg_final.transformation
+    print(f"[Final] full-res thr={final_thresh:.4f} rmse={reg_final.inlier_rmse:.5f} mode={final_mode}")
+
+    info = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+        src, tgt, max_correspondence_distance=final_thresh, transformation=T
+    )
+    return T, info
+  
+def quat_xyzw_to_R(qx, qy, qz, qw):
+    # unit quaternion -> 3x3 rotation (x,y,z,w convention)
+    xx, yy, zz = qx*qx, qy*qy, qz*qz
+    xy, xz, yz = qx*qy, qx*qz, qy*qz
+    wx, wy, wz = qw*qx, qw*qy, qw*qz
+    return np.array([
+        [1-2*(yy+zz),   2*(xy - wz),     2*(xz + wy)],
+        [2*(xy + wz),   1-2*(xx+zz),     2*(yz - wx)],
+        [2*(xz - wy),   2*(yz + wx),     1-2*(xx+yy)]
+    ], dtype=float)
+
+def R_to_quat_xyzw(R):
+    """
+    Rotation matrix (3x3) -> quaternion in (x, y, z, w) order.
+    Robust, handles small numerical issues, and normalizes.
+    """
+    m00, m01, m02 = R[0,0], R[0,1], R[0,2]
+    m10, m11, m12 = R[1,0], R[1,1], R[1,2]
+    m20, m21, m22 = R[2,0], R[2,1], R[2,2]
+    trace = m00 + m11 + m22
+
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (m21 - m12) / s
+        qy = (m02 - m20) / s
+        qz = (m10 - m01) / s
+    elif (m00 > m11) and (m00 > m22):
+        s = np.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        qw = (m21 - m12) / s
+        qx = 0.25 * s
+        qy = (m01 + m10) / s
+        qz = (m02 + m20) / s
+    elif m11 > m22:
+        s = np.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        qw = (m02 - m20) / s
+        qx = (m01 + m10) / s
+        qy = 0.25 * s
+        qz = (m12 + m21) / s
+    else:
+        s = np.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        qw = (m10 - m01) / s
+        qx = (m02 + m20) / s
+        qy = (m12 + m21) / s
+        qz = 0.25 * s
+
+    q = np.array([qx, qy, qz, qw], dtype=float)
+    q /= np.linalg.norm(q)  # normalize
+    return q
+
+def pose7_from_T(T, prefer_quat_sign=None):
+    """
+    4x4 SE(3) -> [x, y, z, qx, qy, qz, qw]
+    prefer_quat_sign: optional 4-vector (qx,qy,qz,qw) to keep sign continuity
+                      (flips the result if dot < 0).
+    """
+    R = T[:3, :3]
+    t = T[:3,  3]
+    q = R_to_quat_xyzw(R)
+
+    if prefer_quat_sign is not None:
+        # keep quaternion sign consistent with a reference (avoids sudden flips)
+        if np.dot(q, np.asarray(prefer_quat_sign, dtype=float)) < 0:
+            q = -q
+    return np.array([t[0], t[1], t[2], q[0], q[1], q[2], q[3]], dtype=float)
+
+import numpy as np
+import open3d as o3d
+
+
+def np_to_pcd(pts):
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=np.float64))
+    return pc
+
+def ensure_normals(pcd, radius, max_nn=120, towards=None):
+    if len(pcd.points) < 30:
+        return False
+    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max_nn))
+    if towards is not None:
+        pcd.orient_normals_towards_camera_location(np.asarray(towards, dtype=float))
+    else:
+        try:
+            pcd.orient_normals_consistent_tangent_plane(50)
+        except Exception:
+            pass
+    return pcd.has_normals()
+
+import copy  # <-- add at top
+
+def crop_target_around_transformed_source(src, tgt, T, radius):
+    """Clone+transform source; do NOT mutate original."""
+    if len(tgt.points) == 0 or len(src.points) == 0:
+        return tgt
+    src_tf = copy.deepcopy(src)   # <-- was: src.clone()
+    src_tf.transform(T)           # transforms the copy only
+    kdt = o3d.geometry.KDTreeFlann(tgt)
+    mask = np.zeros(len(tgt.points), dtype=bool)
+    tgt_np = np.asarray(tgt.points)
+    step = max(1, len(src_tf.points)//4000)
+    for p in np.asarray(src_tf.points)[::step]:
+        _, idx, _ = kdt.search_radius_vector_3d(p, radius)
+        mask[idx] = True
+    if not mask.any():
+        return tgt
+    cropped = o3d.geometry.PointCloud()
+    cropped.points = o3d.utility.Vector3dVector(tgt_np[mask])
+    if tgt.has_normals():
+        cropped.normals = o3d.utility.Vector3dVector(np.asarray(tgt.normals)[mask])
+    return cropped
+  
+
+  
+def icp_refine_safe(src_pts: np.ndarray,
+                    tgt_pts: np.ndarray,
+                    T_init=np.eye(4),
+                    cam_center=None,
+                    crop_radius=0.035,     # loosen a bit so we have matches
+                    max_corr=0.006,        # 6 mm (tight but workable)
+                    max_iter=80):
+    assert src_pts.ndim==2 and src_pts.shape[1]==3 and tgt_pts.ndim==2 and tgt_pts.shape[1]==3
+    src = np_to_pcd(src_pts)
+    tgt = np_to_pcd(tgt_pts)
+
+    # normals
+    ensure_normals(src, radius=0.02, max_nn=100, towards=cam_center)
+    ensure_normals(tgt, radius=0.02, max_nn=150)
+
+    # crop to overlap
+    tgt_crop = crop_target_around_transformed_source(src, tgt, T_init, radius=crop_radius)
+    if len(tgt_crop.points) < 50:
+        tgt_crop = tgt  # if we cropped too aggressively
+
+    # baseline metrics
+    base_eval = o3d.pipelines.registration.evaluate_registration(src, tgt_crop, max_corr, T_init)
+    print(f"Baseline: fitness={base_eval.fitness:.4f}, rmse={base_eval.inlier_rmse:.6f}")
+
+    # run ICP
+    est = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+    reg = o3d.pipelines.registration.registration_icp(
+        src, tgt_crop, max_corr, T_init, est,
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter)
+    )
+    print(f"Refined : fitness={reg.fitness:.4f}, rmse={reg.inlier_rmse:.6f}")
+
+    # accept if RMSE decreased OR fitness improved meaningfully
+    improved = (reg.inlier_rmse < base_eval.inlier_rmse * 0.995) or \
+               (reg.fitness > base_eval.fitness * 1.02)
+
+    if not improved:
+        # as a second try, allow a bit looser threshold with GICP
+        try:
+            reg_g = o3d.pipelines.registration.registration_generalized_icp(
+                src, tgt_crop, max_corr*1.5, T_init,
+                o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter)
+            )
+            print(f"GICP    : fitness={reg_g.fitness:.4f}, rmse={reg_g.inlier_rmse:.6f}")
+            improved = (reg_g.inlier_rmse < base_eval.inlier_rmse * 0.995) or \
+                       (reg_g.fitness > base_eval.fitness * 1.02)
+            if improved:
+                return reg_g.transformation, reg_g
+        except Exception:
+            pass
+        # no real improvement → keep the original pose
+        return T_init, base_eval
+
+    return reg.transformation, reg
+
+def export_like_loadPointCloud(points_np: np.ndarray):
+    """Return (N, [POINT3D,...]) exactly like loadPointCloud()."""
+    n = int(points_np.shape[0])
+    p3dlist = [POINT3D(x, y, z) for x, y, z in points_np]
+    return n, p3dlist
+
+# --- If your points are in an Open3D PointCloud `pcd` ---
+def export_o3d_like_loadPointCloud(pcd):
+    pts = np.asarray(pcd.points, dtype=float)
+    return export_like_loadPointCloud(pts)
+
+def goicp_to_T(R_list, t_list):
+    """
+    Go-ICP -> 4x4 SE(3) transform.
+    R_list: python list (3x3) from goicp.optimalRotation()
+    t_list: python list (len 3 or 1x3/3x1) from goicp.optimalTranslation()
+    Returns T such that X_target ≈ R * X_source + t  (i.e., source -> target)
+    """
+    R = np.array(R_list, dtype=float).reshape(3, 3)
+    t = np.array(t_list, dtype=float).reshape(-1)
+    if t.size != 3:
+        t = t.reshape(3)
+
+    # (optional but recommended) enforce a proper rotation numerically
+    U, S, Vt = np.linalg.svd(R)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:  # fix possible reflection
+        U[:, -1] *= -1
+        R = U @ Vt
+
+    T = np.eye(4, dtype=float)
+    T[:3, :3] = R
+    T[:3,  3] = t
+    return T
+
 FX = 554.254691191187
 FY = 554.254691191187
 CX = 320.5
 CY = 240.5
 
-def label_points_from_seg(points_np, labels, fx=FX, fy=FY, cx=CX, cy=CY):
-    """
-    points_np: (N,3) XYZ in camera optical frame (meters)
-    labels: (H,W) int32 from load_seg_as_labels
-    returns: point_labels (N,) int32, -1 for unlabeled/out of bounds
-    """
-    Z = points_np[:, 2]
-    # project (X,Y,Z) -> (u,v)
-    u = np.round(fx * (points_np[:,0] / Z) + cx).astype(np.int32)
-    v = np.round(fy * (points_np[:,1] / Z) + cy).astype(np.int32)
-
-    H, W = labels.shape
-    valid = (Z > 0) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
-    point_labels = np.full(points_np.shape[0], -1, dtype=np.int32)
-    point_labels[valid] = labels[v[valid], u[valid]]
-    return point_labels
-
-def split_points_by_label(points_np, point_labels, ignore_label=-1):
-    """
-    Returns dict: {label_id: (M_i,3) points}
-    """
-    clusters = {}
-    for lab in np.unique(point_labels):
-        if lab == ignore_label:
-            continue
-        clusters[lab] = points_np[point_labels == lab]
-    return clusters
-
-def dtheta(theta, arclength, threshold, scale, epsilon):
-    # calculation the sampling step size
-    if theta < threshold:
-        dt = np.abs(np.power(arclength / scale[1] +np.power(theta, epsilon), \
-             (1 / epsilon)) - theta)
-    else:
-        dt = arclength / epsilon * ((np.cos(theta) ** 2 * np.sin(theta) ** 2) /
-             (scale[0] ** 2 * np.cos(theta) ** (2 * epsilon) * np.sin(theta) ** 4 +
-             scale[1] ** 2 * np.sin(theta) ** (2 * epsilon) * np.cos(theta) ** 4)) ** (1 / 2)
-    
-    return dt
-  
-def angle2points(theta, scale, epsilon):
-
-    point = np.zeros((2, np.shape(theta)[0]))
-    point[0] = scale[0] * np.sign(np.cos(theta)) * np.abs(np.cos(theta)) ** epsilon
-    point[1] = scale[1] * np.sign(np.sin(theta)) * np.abs(np.sin(theta)) ** epsilon
-
-    return point
-
-def uniformSampledSuperellipse(epsilon, scale, threshold = 1e-2, num_limit = 10000, arclength = 0.02):
-
-    # initialize array storing sampled theta
-    theta = np.zeros(num_limit)
-    theta[0] = 0
-
-    for i in range(num_limit):
-        dt = dtheta(theta[i], arclength, threshold, scale, epsilon)
-        theta_temp = theta[i] + dt
-
-        if theta_temp > np.pi / 4:
-            theta[i + 1] = np.pi / 4
-            break
-        else:
-            if i + 1 < num_limit:
-                theta[i + 1] = theta_temp
-            else:
-                raise Exception(
-                'Number of the sampled points exceed the preset limit', \
-                num_limit,
-                'Please decrease the sampling arclength.'
-                )
-    critical = i + 1
-
-    for j in range(critical + 1, num_limit):
-        dt = dtheta(theta[j], arclength, threshold, np.flip(scale), epsilon)
-        theta_temp = theta[j] + dt
-        
-        if theta_temp > np.pi / 4:
-            break
-        else:
-            if j + 1 < num_limit:
-                theta[j + 1] = theta_temp
-            else:
-                raise Exception(
-                'Number of the sampled points exceed the preset limit', \
-                num_limit,
-                'Please decrease the sampling arclength.'
-                )
-    num_pt = j
-    theta = theta[0 : num_pt + 1]
-
-    point_fw = angle2points(theta[0 : critical + 1], scale, epsilon)
-    point_bw = np.flip(angle2points(theta[critical + 1: num_pt + 1], np.flip(scale), epsilon), (0, 1))
-    point = np.concatenate((point_fw, point_bw), 1)
-    point = np.concatenate((point, np.flip(point[:, 0 : num_pt], 1) * np.array([[-1], [1]]), 
-                           point[:, 1 : num_pt + 1] * np.array([[-1], [-1]]),
-                           np.flip(point[:, 0 : num_pt], 1) * np.array([[1], [-1]])), 1)
-
-    return point
-
-def build_rotation_matrix_numpy(theta_np):
-    """
-    theta_np: numpy array of shape (11,)
-    returns: 3x3 rotation matrix
-    """
-    rz, ry, rx = theta_np[5:8]
-    rot = R.from_euler('ZYX', [rz, ry, rx])  # careful with order!!
-    return rot.as_matrix()
-
-def bend_points_numpy(P, b, alpha):
-    """
-    P: (..., 3) points in the local (unposed) frame
-    b: bending parameter (>0)
-    alpha: bending direction in xy (radians)
-    """
-    # guardrails
-    b = max(float(b), 1e-6)
-
-    x, y, z = P[..., 0], P[..., 1], P[..., 2]
-
-    rho = np.sqrt(x*x + y*y)                     # radial distance in xy
-    ang = np.arctan2(y, x)                       # angle of (x,y)
-    r   = np.cos(alpha - ang) * rho              # projected radius along alpha
-    gamma = b * z
-
-    invb = 1.0 / b
-    R = invb - (invb - r) * np.cos(gamma)
-
-    dx = (R - r) * np.cos(alpha)
-    dy = (R - r) * np.sin(alpha)
-    dz = (invb - r) * np.sin(gamma)
-
-    out = np.empty_like(P)
-    out[..., 0] = x + dx
-    out[..., 1] = y + dy
-    out[..., 2] = dz
-    return out
-
-def get_translation_numpy(theta_np):
-    """
-    theta_np: numpy array of shape (11,)
-    returns: (3,) translation vector
-    """
-    return theta_np[8:11]
-  
-def showSuperquadrics(x,b=0, alpha=0, threshold = 1e-2, num_limit = 10000, arclength = 0.02):
-    print("inside showsuperquadrics b:", b, " alpha: ", alpha)
-    # avoid numerical instability in sampling
-    if x[0] < 0.007:
-        x[0] = 0.007
-    if x[1] < 0.007:
-        x[1] = 0.007
-    # sampling points in superellipse    
-    point_eta = uniformSampledSuperellipse(x[0], [1, x[4]], threshold, num_limit, arclength)
-    point_omega = uniformSampledSuperellipse(x[1], [x[2], x[3]], threshold, num_limit, arclength)
-    
-    # preallocate meshgrid
-    x_mesh = np.ones((np.shape(point_omega)[1], np.shape(point_eta)[1]))
-    y_mesh = np.ones((np.shape(point_omega)[1], np.shape(point_eta)[1]))
-    z_mesh = np.ones((np.shape(point_omega)[1], np.shape(point_eta)[1]))
-    RotM = build_rotation_matrix_numpy(x)
-    print("RotM: ", RotM)
-    for m in range(np.shape(point_omega)[1]):
-        for n in range(np.shape(point_eta)[1]):
-            point_temp = np.zeros(3)
-            point_temp[0 : 2] = point_omega[:, m] * point_eta[0, n]
-            point_temp[2] = point_eta[1, n]
-            
-            # # >>> NEW: bend in local frame <<<
-            if b > 0.0:
-                point_temp = bend_points_numpy(point_temp[None, :], b, alpha)[0]
-
-            # then pose
-            point_temp = point_temp@RotM.T + get_translation_numpy(x)
-
-            x_mesh[m, n] = point_temp[0]
-            y_mesh[m, n] = point_temp[1]
-            z_mesh[m, n] = point_temp[2]
-    
-    # mlab.view(azimuth=0.0, elevation=0.0, distance=2)
-    mlab.mesh(x_mesh, y_mesh, z_mesh, color=(0.894, 0.447, 0.0), opacity=0.8)
-
-def showSupertoroid(x, threshold=1e-2, num_limit=10000, arclength=0.02, color=(0.894, 0.447, 0.0)):
-    """
-    x layout (mirrors your superellipsoid param vector):
-      x[0]=eps_eta (tube exponent), x[1]=eps_omega (ring exponent),
-      x[2]=a_r (tube radius in r), x[3]=R (major ring radius), x[4]=a_z (tube radius in z),
-      x[5:8]=Euler, x[8:11]=translation.
-    """
-    # clamps for stability
-    e_eta   = max(float(x[0]), 0.05)
-    e_omega = max(float(x[1]), 0.05)
-    a_r     = max(float(x[3]), 1e-4)
-    Rmaj       = max(float(x[2]), a_r + 1e-4)  # keep hole open / avoid self-intersection
-    a_z     = max(float(x[4]), 1e-4)
-
-    # superellipse samples:
-    # - cross-section (ρ,z) in the rz-plane:  [ a_r*cos^e_eta(η),  a_z*sin^e_eta(η) ]
-    se_eta   = uniformSampledSuperellipse(e_eta,   [a_r, a_z], threshold, num_limit, arclength)
-    # - ring direction, unit superellipse on xy-plane: [ cos^e_omega(ω), sin^e_omega(ω) ]
-    se_omega = uniformSampledSuperellipse(e_omega, [1.0, 1.0], threshold, num_limit, arclength)
-
-    M, N = se_omega.shape[1], se_eta.shape[1]
-    x_mesh = np.empty((M, N), dtype=float)
-    y_mesh = np.empty((M, N), dtype=float)
-    z_mesh = np.empty((M, N), dtype=float)
-
-    RotM = build_rotation_matrix_numpy(x)      # your function
-    t    = get_translation_numpy(x)            # your function
-
-    for m in range(M):
-        c2 = se_omega[0, m]   # cos^{e_omega}(ω)
-        s2 = se_omega[1, m]   # sin^{e_omega}(ω)
-        for n in range(N):
-            rho = se_eta[0, n]  # a_r * cos^{e_eta}(η)
-            z   = se_eta[1, n]  # a_z * sin^{e_eta}(η)
-
-            # canonical -> world (same as your superellipsoid):
-            pt_local  = np.array([(Rmaj + rho) * c2, (Rmaj + rho) * s2, z], dtype=float)
-            pt_world  = pt_local @ RotM.T + t
-
-            x_mesh[m, n], y_mesh[m, n], z_mesh[m, n] = pt_world
-
-    mlab.mesh(x_mesh, y_mesh, z_mesh, color=color, opacity=0.8)
-
-def showTaperedSuperparaboloidWithBase(x, r_offset=0.01, threshold=1e-2, num_limit=10000, arclength=0.02):
-    import numpy as np
-    from mayavi import mlab
-
-    x = np.asarray(x).flatten()
-
-    # Avoid numerical issues
-    x[0] = max(x[0], 0.007)
-    x[1] = max(x[1], 0.007)
-
-    e1, e2 = x[0], x[1]
-    a1, a2, a3 = x[2], x[3], x[4]
-    rot = build_rotation_matrix_numpy(x)
-    trans = get_translation_numpy(x)
-
-    # Create grid
-    num_z = 100
-    num_omega = 100
-    z_vals = np.linspace(0, a3, num_z)
-    omega_vals = np.linspace(0, 2 * np.pi, num_omega)
-
-    x_mesh = np.zeros((num_omega, num_z))
-    y_mesh = np.zeros((num_omega, num_z))
-    z_mesh = np.zeros((num_omega, num_z))
-
-    for j, z in enumerate(z_vals):
-        r = r_offset + (z / a3) ** (1 / e1)
-
-        for i, omega in enumerate(omega_vals):
-            cos_e = np.sign(np.cos(omega)) * np.abs(np.cos(omega)) ** e2
-            sin_e = np.sign(np.sin(omega)) * np.abs(np.sin(omega)) ** e2
-
-            px = a1 * r * cos_e
-            py = a2 * r * sin_e
-            pz = z
-
-            point = np.array([px, py, pz]) @ rot.T + trans
-            x_mesh[i, j] = point[0]
-            y_mesh[i, j] = point[1]
-            z_mesh[i, j] = point[2]
-
-    mlab.mesh(x_mesh, y_mesh, z_mesh, color=(0.894, 0.447, 0.0), opacity=0.8)
-
-def showPoints(points, scale_factor=0.1, color =(1, 0, 0), figure=None):
-    if figure is None:
-        figure = mlab.gcf()
-    return mlab.points3d(points[:,0], points[:,1], points[:,2],
-                         scale_factor=scale_factor, color=color, figure=figure)
-
-def _pick_test(scene_dir: Path, which: Union[int, str]) -> int:
-    if isinstance(which, int):
-        return which
-    if which != "latest":
-        raise ValueError("which must be an int or 'latest'")
-    tests = []
-    for p in scene_dir.iterdir():
-        m = re.match(r"^test(\d+)$", p.name)
-        if p.is_dir() and m:
-            tests.append(int(m.group(1)))
-    if not tests:
-        raise FileNotFoundError(f"No test* folders in {scene_dir}")
-    return max(tests)
-
-def _as_float(x):
-    return None if x is None else float(x)
-
-def _as_float_arr11(x):
-    arr = np.asarray(x, dtype=np.float64).reshape(-1)
-    if arr.size != 11:
-        raise ValueError(f"theta must have 11 elements, got {arr.size}")
-    return arr
-
-def _as_int_arr(x):
-    if x is None:
-        return np.empty((0,), dtype=np.int64)
-    return np.asarray(x, dtype=np.int64).reshape(-1)
-
-def read_cluster_yaml(
-    base_path: Union[str, Path],
-    scene_: str,
-    cluster_id: int,
-    which: Union[int, str] = "latest",
-) -> Dict[str, Any]:
-    """
-    Load ONE cluster{cluster_id}.yaml and return a dict:
-      {
-        'scene': str,
-        'test': int,
-        'cluster_id': int,
-        'object': str,
-        'timestamp': str,
-        'n_shapes': int,
-        'shapes': [
-          {
-            'type': str,
-            'theta': np.ndarray(11,),
-            'k': Optional[float],
-            'b': Optional[float],
-            'alpha': Optional[float],
-            'free_space_penalty': float,
-            'indices_good': np.ndarray(int64),
-            'indices_bad': np.ndarray(int64),
-            'indices_remaining': np.ndarray(int64),
-          }, ...
-        ]
-      }
-    """
-    base_path = Path(base_path)
-    scene_dir = base_path / scene_
-    
-    test_n = _pick_test(scene_dir, which)
-    f = scene_dir / f"test{test_n}" / f"cluster{cluster_id}"/f"cluster{cluster_id}.yaml"
-    if not f.exists():
-        raise FileNotFoundError(f"Missing {f}")
-
-    data = yaml.safe_load(f.read_text()) or {}
-
-    # normalize shapes
-    shapes_out: List[Dict[str, Any]] = []
-    for s in data.get("shapes", []) or []:
-        shapes_out.append({
-            "type": str(s.get("type", "superquadric")),
-            "theta": _as_float_arr11(s.get("theta", [])),
-            "k": _as_float(s.get("k")),
-            "b": _as_float(s.get("b")),
-            "alpha": _as_float(s.get("alpha")),
-            "free_space_penalty": float(s.get("free_space_penalty", 0.0)),
-            "indices_good": _as_int_arr(s.get("indices_good")),
-            "indices_bad": _as_int_arr(s.get("indices_bad")),
-            "indices_remaining": _as_int_arr(s.get("indices_remaining")),
-        })
-
-    return {
-        "scene": str(data.get("scene", "")),
-        "test": int(data.get("test", test_n)),
-        "cluster_id": int(data.get("cluster_id", cluster_id)),
-        "object": str(data.get("object", "")),
-        "timestamp": str(data.get("timestamp", "")),
-        "n_shapes": int(data.get("n_shapes", len(shapes_out))),
-        "shapes": shapes_out,
-    }
-
-def build_rotation_matrix(euler_angles):
-    rz, ry, rx = euler_angles
-
-    cosx = torch.cos(rx)
-    sinx = torch.sin(rx)
-    cosy = torch.cos(ry)
-    siny = torch.sin(ry)
-    cosz = torch.cos(rz)
-    sinz = torch.sin(rz)
-
-    # Rotation around x-axis
-    Rx = torch.stack([
-        torch.stack([torch.tensor(1., device=euler_angles.device), torch.tensor(0., device=euler_angles.device), torch.tensor(0., device=euler_angles.device)]),
-        torch.stack([torch.tensor(0., device=euler_angles.device), cosx, -sinx]),
-        torch.stack([torch.tensor(0., device=euler_angles.device), sinx,  cosx])
-    ])
-
-    # Rotation around y-axis
-    Ry = torch.stack([
-        torch.stack([cosy, torch.tensor(0., device=euler_angles.device), siny]),
-        torch.stack([torch.tensor(0., device=euler_angles.device), torch.tensor(1., device=euler_angles.device), torch.tensor(0., device=euler_angles.device)]),
-        torch.stack([-siny, torch.tensor(0., device=euler_angles.device), cosy])
-    ])
-
-    # Rotation around z-axis
-    Rz = torch.stack([
-        torch.stack([cosz, -sinz, torch.tensor(0., device=euler_angles.device)]),
-        torch.stack([sinz,  cosz, torch.tensor(0., device=euler_angles.device)]),
-        torch.stack([torch.tensor(0., device=euler_angles.device), torch.tensor(0., device=euler_angles.device), torch.tensor(1., device=euler_angles.device)])
-    ])
-
-    R = Rz @ Ry @ Rx
-    return R
-
-def sq_distances(points, theta):
-    """
-    Compute distances from points to the superquadric surface.
-    This version is differentiable if called with grad enabled.
-    """
-
-
-    # Rotation + translation
-    R = build_rotation_matrix(theta[5:8])
-    t = theta[8:11]
-    points_local = points @ R - t @ R
-
-
-    # parameters
-    a1 = theta[2].abs().clamp_min(1e-6)
-    a2 = theta[3].abs().clamp_min(1e-6)
-    a3 = theta[4].abs().clamp_min(1e-6)
-    e1, e2 = theta[0], theta[1]
-
-    # normalize
-    x_ = points_local[:, 0] / a1
-    y_ = points_local[:, 1] / a2
-    z_ = points_local[:, 2] / a3
-
-    # superquadric inside-outside function
-    term1 = (torch.abs(x_)**(2/e2) + torch.abs(y_)**(2/e2))**(e2/e1)
-    term2 = (torch.abs(z_)**(2/e1))
-    inside_outside = term1 + term2
-
-    # radial norm
-    r_norm = torch.norm(points_local, dim=1)
-
-    # distance formula
-    distances = r_norm * torch.abs(inside_outside**(-e1/2) - 1)
-
-    return distances  # (N,) tensor
-  
-def st_distances(points, theta, eps=1e-6):
-    """
-    Supertoroid distance surrogate:  d ≈ |F| / ||∇F||.
-    theta = [e_eta, e_omega, Rmaj, a_r, a_z, rz, ry, rx, tx, ty, tz]
-    F = ((|rho|/a_r)^(2/e_eta) + (|z|/a_z)^(2/e_eta))^(e_eta/2) - 1,
-    where rho = r_xy(e_omega) - Rmaj and r_xy = (|x|^p + |y|^p)^(1/p), p=2/e_omega.
-    """
-    tiny = 1e-12
-
-    # pose
-    Rm = build_rotation_matrix(theta[5:8])   # (3,3)
-    t  = theta[8:11]                         # (3,)
-    pl = points @ Rm - t @ Rm
-
-    x, y, z = pl[:,0], pl[:,1], pl[:,2]
-
-    # params
-    e_eta   = theta[0].abs().clamp_min(0.05)
-    e_omega = theta[1].abs().clamp_min(0.05)
-    Rmaj    = theta[2].abs().clamp_min(tiny)
-    a_r     = theta[3].abs().clamp_min(tiny)
-    a_z     = theta[4].abs().clamp_min(tiny)
-
-    # implicit F
-    p = 2.0 / e_omega
-    q = 2.0 / e_eta
-
-    r_xy = (x.abs().clamp_min(tiny).pow(p) + y.abs().clamp_min(tiny).pow(p)).pow(1.0/p)
-    rho  = r_xy - Rmaj
-    u = (rho.abs() / a_r).clamp_min(tiny).pow(q)
-    v = (z.abs()   / a_z).clamp_min(tiny).pow(q)
-    G = (u + v).clamp_min(tiny).pow(1.0/q)       # ==1 on surface
-    phi = G - 1.0
-
-    # grad norm via autograd w.r.t. points only (pose detached for efficiency)
-    Rm_d = Rm.detach()
-    t_d  = t.detach()
-    pts = points.detach().requires_grad_(True)
-    pl2 = (pts - t_d) @ Rm_d
-    x2, y2, z2 = pl2[:,0], pl2[:,1], pl2[:,2]
-    r_xy2 = (x2.abs().clamp_min(tiny).pow(p) + y2.abs().clamp_min(tiny).pow(p)).pow(1.0/p)
-    rho2  = r_xy2 - Rmaj
-    u2 = (rho2.abs() / a_r).clamp_min(tiny).pow(q)
-    v2 = (z2.abs()   / a_z).clamp_min(tiny).pow(q)
-    G2 = (u2 + v2).clamp_min(tiny).pow(1.0/q)
-    phi2 = G2 - 1.0
-
-    g = torch.autograd.grad(phi2.sum(), pts, create_graph=False, retain_graph=False)[0]
-    gradnorm = g.norm(dim=1).clamp_min(eps).detach()
-
-    d = phi.abs() / gradnorm
-    return d
-
-def spb_distances_autograd(points, theta, k, eps=1e-9):
-    tiny = 1e-12
-    Rm = build_rotation_matrix(theta[5:8])
-    t  = theta[8:11]
-
-    e1 = theta[0].abs().clamp_min(0.05)
-    e2 = theta[1].abs().clamp_min(0.05)
-    a1 = theta[2].abs().clamp_min(tiny)
-    a2 = theta[3].abs().clamp_min(tiny)
-    a3 = theta[4].abs().clamp_min(tiny)
-    k  = torch.as_tensor(k, device=points.device, dtype=points.dtype).clamp_min(0.0)
-
-    # local coords for F (no grad on pose/params for gradnorm)
-    Rm_d, t_d = Rm.detach(), t.detach()
-    pts = points.detach().requires_grad_(True)
-    pl = (pts - t_d) @ Rm_d
-    x, y, z = pl[:,0], pl[:,1], pl[:,2]
-
-    p = 2.0 / e2
-    u = (x.abs().clamp_min(tiny)/a1).pow(p) + (y.abs().clamp_min(tiny)/a2).pow(p)
-    term1 = u.clamp_min(tiny).pow(e2/2.0)
-    # keep one–sided opening but smooth: use softplus instead of hard clamp if desired
-    zplus = torch.clamp(z, min=0.0)
-    term2 = (zplus.clamp_min(tiny)/a3).pow(1.0/e1)
-
-    phi = term1 - term2 - k
-
-    g = torch.autograd.grad(phi.sum(), pts, create_graph=False, retain_graph=False)[0]
-    gradnorm = g.norm(dim=1).clamp_min(eps).detach()
-
-    d = phi.abs().detach() / gradnorm
-    return d
-  
-scene_ = "scene_39"
-
-
+scene_ = "scene_25"
+method_ = "ems"
+number_samples_per_ray_ = 300
+sampled_by_shape = []
+device = 'cuda'
 base_path = "/home/elisabeth/repos/ProbabilisticSuperquadricFitting/results/check"
-
+base_path = "/home/elisabeth/repos/EMS-superquadric_fitting/results_EMS/check"
 scene_dir = Path(base_path) / scene_
 
 
-point_cloud = read_with_open3d("/home/elisabeth/repos/ProbabilisticSuperquadricFitting/data/sceneReplica/final_scenes/pcds/"+scene_+"/cloud.pcd")
-point_cloud = remove_close_points(point_cloud, 0.003)
-filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.003)
-filtered_points, plane_points1, plane_model1 = remove_largest_plane(filtered_points, distance_threshold=0.003)
-point_cloud = filter_by_z(point_cloud, -np.inf, 1.5)
 
-labels, id2color = load_seg_as_labels("/home/elisabeth/repos/ProbabilisticSuperquadricFitting/data/sceneReplica/final_scenes/segmasks/"+scene_+"/gtseg_ord-nearest_first_step-0.png", inflate_px=10)
-point_labels = label_points_from_seg(filtered_points, labels)
-clusters = split_points_by_label(filtered_points, point_labels)
 
+point_cloud = tools.read_with_open3d("/home/elisabeth/repos/ProbabilisticSuperquadricFitting/data/sceneReplica/final_scenes/pcds/"+scene_+"/cloud.pcd")
+point_cloud = tools.remove_close_points(point_cloud, 0.003)
+filtered_points, plane_points, plane_model = tools.remove_largest_plane(point_cloud, distance_threshold=0.003)
+filtered_points, plane_points1, plane_model1 = tools.remove_largest_plane(filtered_points, distance_threshold=0.003)
+point_cloud = tools.filter_by_z(point_cloud, -np.inf, 1.5)
+
+all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
+
+
+labels, id2color = tools.load_seg_as_labels("/home/elisabeth/repos/ProbabilisticSuperquadricFitting/data/sceneReplica/final_scenes/segmasks/"+scene_+"/gtseg_ord-nearest_first_step-0.png", inflate_px=5)
+point_labels = tools.label_points_from_seg(filtered_points, labels, FX, FY, CX, CY)
+clusters = tools.split_points_by_label(filtered_points, point_labels)
+
+clusters_pruned, rep = tools.prune_clusters_like(
+    clusters,
+    dbscan_min_samples=20,
+    keep_quantile=0.95,
+    min_points_after=30,
+    gap_min=0.01,        # 5 cm gap to drop tiny islands
+    rel_size_max=0.30    # drop components <20% of main if also far
+)
+
+clusters = clusters_pruned
 fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-showPoints(filtered_points, scale_factor=0.0025)
+plot_functions.showPoints(filtered_points, scale_factor=0.0025)
 mlab.show()
 all_params_modeled = {}
 idx = 0
@@ -721,9 +552,43 @@ idx = 0
 tau_10 = 0.010
 tau_5 = 0.005
 
+voxel_scales = (0.01, 0.005, 0.002)              # 10mm → 5mm → 2mm
+max_corr_multipliers = (2.0, 1.5, 1.2)           # tighter thresholds
+iters = (80, 60, 50)                             # a few more iterations
+
+# when estimating normals at each level, use a bigger neighborhood at fine scale
+normal_radius_factor = (3.0, 4.0, 6.0)           # radius = voxel * factor
+max_nn_levels = (40, 60, 80)
+
+ap,bp,cp,dp = plane_model
+
+    
+scene_data = tools.load_scene_file_cam("/home/elisabeth/repos/ProbabilisticSuperquadricFitting/data/sceneReplica/final_scenes/scene_data/"+scene_+"_wrt_cam.json")
 for lid, cluster in clusters.items():
+    if lid ==1:
+        continue
+    if scene_ == "scene_104" and lid ==5:
+        continue
     all_dists = []
-    c = read_cluster_yaml(base_path, scene_, cluster_id=lid, which="latest")
+    all_dists_object = []
+    device = 'cuda'
+    thetas_sq = []           # list[torch.Tensor] where each is shape (11,)
+    sq_indices = []          # keep mapping to shapes_list indices if you need it
+    
+    # Pre-allocate collectors
+    dmins_list   = []   # list of (N,) tensors       — per-shape nearest distances
+    qmins_list   = []   # list of (N,3) tensors     — per-shape nearest sampled points (world)
+    idx_list     = []   # list of (N,) long tensors — per-shape indices into that shape's samples
+    shape_ids    = []   # list of ints              — index in shapes_list (or your own id)
+
+    dmins_list_object   = []   # list of (N,) tensors       — per-shape nearest distances
+    qmins_list_object   = []   # list of (N,3) tensors     — per-shape nearest sampled points (world)
+    idx_list_object     = []   # list of (N,) long tensors — per-shape indices into that shape's samples
+    shape_ids_object    = []   # list of ints              — index in shapes_list (or your own id)
+    free = 0
+    table_loss = 0
+    penn_table = 0
+    c = tools.read_cluster_yaml(base_path, scene_, cluster_id=lid, which="latest")
     # ---- save top-level fields into variables ----
     scene_val       = c["scene"]
     test_val        = c["test"]
@@ -732,7 +597,7 @@ for lid, cluster in clusters.items():
     timestamp_val   = c["timestamp"]
     n_shapes_val    = c["n_shapes"]
     shapes_list     = c["shapes"]   # list of dicts
-
+    
     # ---- print top-level ----
     print("##################################################################################################################################################################")
     print(f"scene: {scene_val}")
@@ -741,11 +606,63 @@ for lid, cluster in clusters.items():
     print(f"object: {object_val}")
     print(f"timestamp: {timestamp_val}")
     print(f"n_shapes: {n_shapes_val}")
+    
+    pcd, pts_np, nrm_np = tools.mesh_to_point_cloud("/home/elisabeth/repos/ProbabilisticSuperquadricFitting/data/sceneReplica/final_scenes/models/"+object_val+"/textured.obj",
+    n_points=15000,
+    method="poisson",
+    scale=1.0,      
+    voxel_size=0.004,
+    estimate_normals=True,
+    noise_std=0.0,     
+    )
+    
+    
+    pose7_obj_cam = tools.get_object_pose_cam(scene_data, object_val)
+
+
+    T_refined = pose7_to_T(pose7_obj_cam)
+    # T_c_o = object_pose_in_camera(T_w_o, pose7_cam_world)
+    
+    # pts_cam_before, nrm_cam = transform_obj_cloud_into_camera(pts_np, nrm_np, T_c_o)
+
+    
+    # Nm, a_points = export_like_loadPointCloud(cluster)
+    # Nd, b_points = export_like_loadPointCloud(pts_cam_before)
+    # goicp = GoICP();
+    # goicp.loadModelAndData(Nm, a_points, Nd, b_points);
+    # goicp.setDTSizeAndFactor(50, 1.0);
+    # goicp.MSEThresh = 0.00005;
+    # goicp.BuildDT();
+    # goicp.Register();
+    # Rot = goicp.optimalRotation()
+    # t = goicp.optimalTranslation()
+    # print(goicp.optimalRotation()); # A python list of 3x3 is returned with the optimal rotation
+    # print(goicp.optimalTranslation());# A python list of 1x3 is returned with the optimal translation
+
+
+    # T_refined = goicp_to_T(Rot,t)
+
+    pts_cam, nrm_cam = apply_T_points_normals(pts_np, nrm_np, T_refined)
+    
+
+
+
     fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
     mlab.view(azimuth=108.51, elevation=168.97, distance=0.5805, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.864720847838999), roll=-177.93)
-    showPoints(point_cloud, scale_factor=0.0025, color=(0.702, 0.702, 0.702), figure=fig)
+
+    plot_functions.showPoints(pts_cam, scale_factor=0.0025, color=(0, 1, 0), figure=fig)
+    plot_functions.showPoints(point_cloud, scale_factor=0.0025, color=(0.702, 0.702, 0.702), figure=fig)
+    plot_functions.showPoints(cluster, scale_factor=0.0025, color=(1, 0, 0.0), figure=fig)
+    mlab.show()
+    
+    fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+    mlab.view(azimuth=108.51, elevation=168.97, distance=0.5805, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.864720847838999), roll=-177.93)
+    plot_functions.showPoints(point_cloud, scale_factor=0.0025, color=(0.702, 0.702, 0.702), figure=fig)
+    plot_functions.showPoints(pts_cam, scale_factor=0.0025, color=(0, 1, 0), figure=fig)
+
     # ---- iterate shapes, save per-shape variables, and print ----
     for i, s in enumerate(shapes_list):
+    
         shape_type            = s["type"]
         theta                 = s["theta"]            # np.ndarray shape (11,)
         k                     = s["k"]                # float or None
@@ -764,45 +681,297 @@ for lid, cluster in clusters.items():
         print(f"    alpha: {alpha}")
         print(f"    free_space_penalty: {free_space_penalty}")
         if shape_type == "superquadric":
-            showSuperquadrics(theta,b, alpha)
+            #plot_functions.showSuperquadrics(theta,b, alpha)
             points = torch.tensor(cluster, dtype=torch.float32, device='cuda')
+            points_object = torch.tensor(pts_cam, dtype=torch.float32, device='cuda')
             theta_tensor = torch.tensor(theta, dtype=torch.float32, device='cuda')
-            distances = sq_distances(points, theta_tensor).unsqueeze(1)
-            all_dists.append(distances)
+            if method_ =="psqf":
+                distances = tools.sq_distances(points, theta_tensor).unsqueeze(1)
+                distances_object = tools.sq_distances(points_object, theta_tensor).unsqueeze(1)
+
+                all_dists.append(distances)
+                all_dists_object.append(distances_object)
+                
+                th = torch.as_tensor(s["theta"], dtype=torch.float32, device=device)
+                thetas_sq.append(th)
+                sq_indices.append(i)
+                free += tools.compute_free_space(number_samples_per_ray_, all_points, points, theta_tensor, None, None, shape_type)
+                
+                plane_normal = torch.tensor([ap,bp,cp], dtype=torch.float32, device=theta_tensor.device)
+    
+                table_pts = tools.make_table_grid_points(
+                        theta=theta_tensor,
+                        plane_normal=plane_normal,
+                        plane_d=torch.tensor(float(dp), device=theta_tensor.device),
+                        half_size=1.0,      # ±1 m in both in-plane directions
+                        step=0.01,          # 2 cm spacing; adjust as you like
+                        offset_above=0.01,    # or e.g. 0.005 to sit 5 mm above the plane
+                    )
+                
+                table_loss+= tools.table_transverse_loss(table_pts, theta_tensor)
+                penn_table_val = tools.table_violation_metrics(table_pts, theta_tensor)
+                penn_table+= penn_table_val
+            else:
+                th = torch.as_tensor(s["theta"], dtype=torch.float32, device=device)
+                thetas_sq.append(th)
+                sq_indices.append(i)
+                
+                plane_normal = torch.tensor([ap,bp,cp], dtype=torch.float32, device=theta_tensor.device)
+    
+                table_pts = tools.make_table_grid_points(
+                        theta=theta_tensor,
+                        plane_normal=plane_normal,
+                        plane_d=torch.tensor(float(dp), device=theta_tensor.device),
+                        half_size=1.0,      # ±1 m in both in-plane directions
+                        step=0.01,          # 2 cm spacing; adjust as you like
+                        offset_above=0.01,    # or e.g. 0.005 to sit 5 mm above the plane
+                    )
+                
+                free += tools.compute_free_space(number_samples_per_ray_, all_points, points, theta_tensor, None, None, shape_type)
+                table_loss+= tools.table_transverse_loss(table_pts, theta_tensor)
+                
+                penn_table_val = tools.table_violation_metrics(table_pts, theta_tensor)
+                print("penn_table_val: ", penn_table_val)
+                penn_table+= penn_table_val
+                
+                pts_world, normals_world_t = tools.sample_superquadric_points_torch(theta, b=s.get("b", 0.0) or 0.0, alpha=s.get("alpha", 0.0) or 0.0,
+                                                    threshold=1e-2, num_limit=1000, arclength=0.003, device='cuda')
+                print('norm range before call:',
+                normals_world_t.norm(dim=1).min().item(),
+                normals_world_t.norm(dim=1).max().item(),
+                normals_world_t.norm(dim=1).mean().item())
+                normals_world_t = normals_world_t / (normals_world_t.norm(dim=1, keepdim=True).clamp_min(1e-12)
+)
+
+                dmin, idx, qmin,_ , debug= tools.nearest_on_superquadric_mixed(points, pts_world, normals_world_t)
+                print("debug: ", debug)
+                # 3) store
+                dmins_list.append(dmin)
+                qmins_list.append(qmin)
+                idx_list.append(idx)
+                shape_ids.append(i)   # or s["cluster_id"], etc.
+
+                
+                print("dmins_list: ", dmins_list)
+                
+                sampled_by_shape.append(pts_world)
+                
+                pts_world_np = np.ascontiguousarray(pts_world.detach().cpu().numpy())
+                
+                #plot_functions.showPoints(pts_world_np, scale_factor=0.0025, color=(0, 0, 1.0), figure=fig)
+                
+                
+                dmin_object, idx_object, qmin_object, n_q_object, debug = tools.nearest_on_superquadric_mixed(points_object, pts_world, normals_world_t)
+                print("debug: ", debug)
+
+                # 3) store
+                dmins_list_object.append(dmin_object)
+                qmins_list_object.append(qmin_object)
+                idx_list_object.append(idx_object)
+                shape_ids_object.append(i)
+                sampled_by_shape.append(pts_world)
+                
+                print("dmins_list_object: ", dmins_list_object)
+                plot_functions.show_vectors(
+                qmin_object,
+                qmin_object + 0.02 * n_q_object,   # 2 cm arrows (adjust as needed)
+                    color=(1,0,0), mode='arrow', every=10, scale_factor=1.0, figure=fig
+                )
+
+                
+                pts_world_np = np.ascontiguousarray(pts_world.detach().cpu().numpy())
+            # plot_functions.showPoints(pts_world_np, scale_factor=0.0025, color=(0, 1, 0.0), figure=fig)
+
+            
         elif shape_type == "supertoroid":
-            showSupertoroid(theta)
+            plot_functions.showSupertoroid(theta)
             points = torch.tensor(cluster, dtype=torch.float32, device='cuda')
             theta_tensor = torch.tensor(theta, dtype=torch.float32, device='cuda')
-            distances = st_distances(points, theta_tensor).unsqueeze(1)
+            distances = tools.st_distances(points, theta_tensor).unsqueeze(1)
+
+            
             all_dists.append(distances)
+            free+= tools.compute_free_space(number_samples_per_ray_, all_points, points, theta_tensor, None, None, shape_type)
+            
+            points_object = torch.tensor(pts_cam, dtype=torch.float32, device='cuda')
+            distances_object = tools.st_distances(points_object, theta_tensor).unsqueeze(1)
+            all_dists_object.append(distances_object)
+            plane_normal = torch.tensor([ap,bp,cp], dtype=torch.float32, device=theta_tensor.device)
+    
+            table_pts = tools.make_table_grid_points(
+                        theta=theta_tensor,
+                        plane_normal=plane_normal,
+                        plane_d=torch.tensor(float(dp), device=theta_tensor.device),
+                        half_size=1.0,      # ±1 m in both in-plane directions
+                        step=0.01,          # 2 cm spacing; adjust as you like
+                        offset_above=0.01,    # or e.g. 0.005 to sit 5 mm above the plane
+                    )
+                
+            table_loss += tools.table_transverse_loss_toroid(table_pts, theta_tensor)
+            penn_table_val = tools.table_violation_metrics(table_pts, theta_tensor)
+            penn_table+= penn_table_val
+            
+            if method_ =='ems':
+                
+                pts_world = tools.sample_supertoroid_points_torch(theta, b=s.get("b", 0.0) or 0.0, alpha=s.get("alpha", 0.0) or 0.0,
+                                                    threshold=1e-2, num_limit=10000, arclength=0.003, device='cuda')
+                
+                dmin, idx, qmin = tools.nearest_on_superquadric(points, pts_world)
+                
+                # 3) store
+                dmins_list.append(dmin)
+                qmins_list.append(qmin)
+                idx_list.append(idx)
+                shape_ids.append(i)   # or s["cluster_id"], etc.
+
+                
+                print("dmin: ", dmin)
+                
+                sampled_by_shape.append(pts_world)
+                
+                pts_world_np = np.ascontiguousarray(pts_world.detach().cpu().numpy())
+                
+                dmin_object, idx_object, qmin_object = tools.nearest_on_superquadric(points_object, pts_world)
+                
+                # 3) store
+                dmins_list_object.append(dmin_object)
+                qmins_list_object.append(qmin_object)
+                idx_list_object.append(idx_object)
+                shape_ids_object.append(i)   # or s["cluster_id"], etc.
+
+                                
+                sampled_by_shape.append(pts_world)
+                
+                pts_world_np = np.ascontiguousarray(pts_world.detach().cpu().numpy())
+                
+                thetas_sq.append(theta_tensor)
+                sq_indices.append(i)
+
+
         else:
-            showTaperedSuperparaboloidWithBase(theta,k)
+            plot_functions.showTaperedSuperparaboloidWithBase(theta,k)
             points = torch.tensor(cluster, dtype=torch.float32, device='cuda')
             theta_tensor = torch.tensor(theta, dtype=torch.float32, device='cuda')
             k_tensor = torch.tensor(k, dtype=torch.float32, device='cuda')
-            distances = spb_distances_autograd(points, theta_tensor, k_tensor).unsqueeze(1)
+            distances = tools.spb_distances_autograd(points, theta_tensor, k_tensor).unsqueeze(1)
             all_dists.append(distances)
             
+            points_object = torch.tensor(pts_cam, dtype=torch.float32, device='cuda')
+            distances_object = tools.spb_distances_autograd(points_object, theta_tensor, k_tensor).unsqueeze(1)
+            all_dists_object.append(distances_object)
+            
+            if method_ == 'ems':
+                pts_world = tools.sample_tapered_superparaboloid_points_torch(theta, k, b=s.get("b", 0.0) or 0.0, alpha=s.get("alpha", 0.0) or 0.0,
+                                                    threshold=1e-2, num_limit=8000, arclength=0.005, device='cuda')
+                
+                dmin, idx, qmin = tools.nearest_on_superquadric(points, pts_world)
+                
+                # 3) store
+                dmins_list.append(dmin)
+                qmins_list.append(qmin)
+                idx_list.append(idx)
+                shape_ids.append(i)   # or s["cluster_id"], etc.
 
+                
+                print("dmin: ", dmin)
+                
+                sampled_by_shape.append(pts_world)
+                
+                pts_world_np = np.ascontiguousarray(pts_world.detach().cpu().numpy())
+                
+                dmin_object, idx_object, qmin_object = tools.nearest_on_superquadric(points_object, pts_world)
+                
+                # 3) store
+                dmins_list_object.append(dmin_object)
+                qmins_list_object.append(qmin_object)
+                idx_list_object.append(idx_object)
+                shape_ids_object.append(i)   # or s["cluster_id"], etc.
+
+                
+                print("dmin: ", dmin)
+                
+                sampled_by_shape.append(pts_world)
+                
+                pts_world_np = np.ascontiguousarray(pts_world.detach().cpu().numpy())
+                
+                thetas_sq.append(theta_tensor)
+                sq_indices.append(i)
+                
+
+        points = torch.tensor(cluster, dtype=torch.float32, device=device)
+        # chosen_dist, chosen_q, chosen_idx = closest_points_and_outer_distance(points, thetas_sq, device=device)
+        # print("chosen_dist: ", chosen_dist)
         # print(f"    indices_good (n={indices_good.size}): {indices_good.tolist()}")
         # print(f"    indices_bad (n={indices_bad.size}): {indices_bad.tolist()}")
         # print(f"    indices_remaining (n={indices_remaining.size}): {indices_remaining.tolist()}")
-        showPoints(cluster, scale_factor=0.0025, color=(1, 0, 0.0), figure=fig)
+        # Compute per-shape nearest (no global selection)
+
+        #plot_functions.showPoints(cluster, scale_factor=0.0025, color=(1, 0, 0.0), figure=fig)
         print(len(cluster))
         
-        # Stack and take min
+    if method_=="psqf":
         d_all = torch.cat(all_dists, dim=1)  # (N, M)
         d_min, _ = torch.min(d_all, dim=1)   # (N,)
-        
         coverage_5 =  (d_min < tau_5).float().mean()
         coverage_10 =  (d_min < tau_10).float().mean()
-
         rmse = torch.sqrt(torch.mean(d_min**2)).item()
         mae = torch.mean(torch.abs(d_min)).item()
+        penn_table=penn_table_val/len(shapes_list)
         
-        print("rmse: ", rmse)
-        print("mae: ", mae)
-        print("coverage5mm: ", coverage_5)
-        print("coverage5+10mm: ", coverage_10)
+        d_all_object = torch.cat(all_dists_object, dim=1)  # (N, M)
+        d_min_object, _ = torch.min(d_all_object, dim=1)   # (N,)
+        coverage_5_object =  (d_min_object < tau_5).float().mean()
+        coverage_10_object =  (d_min_object < tau_10).float().mean()
+        rmse_object = torch.sqrt(torch.mean(d_min_object**2)).item()
+        mae_object = torch.mean(torch.abs(d_min_object)).item()
+        
+    else:
+        D = torch.stack(dmins_list, dim=1)   # (N, M)
+        Q = torch.stack(qmins_list, dim=1)   # (N, M, 3)
+        chosen_d, chosen_q, chosen_m = tools.select_outside_nearest_from_samples(D, Q, thetas_sq)
+        tau_5, tau_10 = 0.005, 0.010
+        coverage_5  = (chosen_d < tau_5 ).float().mean().item()
+        coverage_10 = (chosen_d < tau_10).float().mean().item()
+        rmse = torch.sqrt((chosen_d**2).mean()).item()
+        mae  = torch.mean(torch.abs(chosen_d)).item()
+        penn_table=penn_table/len(shapes_list)
 
+        Dobject = torch.stack(dmins_list_object, dim=1)   # (N, M)
+        Qobject = torch.stack(qmins_list_object, dim=1)   # (N, M, 3)
+        chosen_d_object, chosen_q_object, chosen_m_object = tools.select_outside_nearest_from_samples(Dobject, Qobject, thetas_sq)
+        tau_5, tau_10 = 0.005, 0.010
+        coverage_5_object  = (chosen_d_object < tau_5 ).float().mean().item()
+        coverage_10_object = (chosen_d_object < tau_10).float().mean().item()
+        rmse_object = torch.sqrt((chosen_d_object**2).mean()).item()
+        mae_object  = torch.mean(torch.abs(chosen_d_object)).item()
+        
+    # d_all = torch.cat(all_dists, dim=1)  # (N, M)
+    # d_min, _ = torch.min(d_all, dim=1)   # (N,)
+        
+    # coverage_5 =  (d_min < tau_5).float().mean()
+    # coverage_10 =  (d_min < tau_10).float().mean()
+
+    # rmse = torch.sqrt(torch.mean(d_min**2)).item()
+    # mae = torch.mean(torch.abs(d_min)).item()
+    
+    # d_use = torch.nan_to_num(chosen_dist, nan=1e9, posinf=1e9, neginf=1e9)  # safety
+
+    # coverage_5  = (d_use < tau_5).float().mean().item()
+    # coverage_10 = (d_use < tau_10).float().mean().item()
+
+    # rmse = torch.sqrt(torch.mean(d_use**2)).item()
+    # mae  = torch.mean(torch.abs(d_use)).item()
+
+    print("rmse: ", rmse)
+    print("mae: ", mae)
+    print("coverage5mm: ", coverage_5)
+    print("coverage5+10mm: ", coverage_10)
+    print("free: ", free)
+    print("table loss:", table_loss)
+    print("penn_table: ", penn_table)
+    print("------------------------------ FULL OBJECT CLOUD-----------------------------")
+    print("rmse: ", rmse_object)
+    print("mae: ", mae_object)
+    print("coverage5mm: ", coverage_5_object)
+    print("coverage5+10mm: ", coverage_10_object)
     mlab.show()
