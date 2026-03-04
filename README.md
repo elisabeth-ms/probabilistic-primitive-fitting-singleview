@@ -1,1 +1,2 @@
 # ProbabilisticSuperquadricFitting
+rocker --home --nvidia --x11 --privileged elisabethmenendez/ubuntu20_04_ros_noetic:pytorch_tesseract6 --network="host" --volume /dev/snd:/dev/snd --privileged --volume /home/elisabeth/repos/tiago-companion:/tiago_dual_public_ws/src/tiago-companion
