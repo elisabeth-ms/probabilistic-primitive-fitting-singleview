@@ -580,6 +580,141 @@ def prune_indices_voxel(points, voxel=0.02):
     key = np.floor(P / voxel).astype(np.int64)
     _, idx = np.unique(key, axis=0, return_index=True)
     return np.sort(idx)
+  
+
+def fingers_sample_pairs_local(finger_segs_local, R_g, t_g, samples_per_seg=15):
+    """
+    Returns:
+        pts_top : (N,3) sampled points on top finger
+        pts_bot : (N,3) sampled points on bottom finger
+        dist    : (N,) distance along the finger segment from p0
+    """
+
+    R_g = np.asarray(R_g, float)
+    t_g = np.asarray(t_g, float).reshape(3,)
+
+    (p0_top, p1_top), (p0_bot, p1_bot) = finger_segs_local
+
+    p0_top = np.asarray(p0_top, float)
+    p1_top = np.asarray(p1_top, float)
+
+    p0_bot = np.asarray(p0_bot, float)
+    p1_bot = np.asarray(p1_bot, float)
+
+    ts = np.linspace(0.0, 1.0, samples_per_seg)
+
+    pts_top = []
+    pts_bot = []
+
+    # segment length (same for both fingers)
+    L = np.linalg.norm(p1_top - p0_top)
+
+    for t in ts:
+
+        pt_top = p0_top + t * (p1_top - p0_top)
+        pt_bot = p0_bot + t * (p1_bot - p0_bot)
+
+        pts_top.append(pt_top)
+        pts_bot.append(pt_bot)
+
+    pts_top = np.array(pts_top)
+    pts_bot = np.array(pts_bot)
+
+    # transform to SQ frame
+    pts_top = (R_g @ pts_top.T).T + t_g
+    pts_bot = (R_g @ pts_bot.T).T + t_g
+
+    dist = ts * L
+
+    return pts_top, pts_bot, dist
+
+def intersect_segment_superquadric_all(p0, p1, theta, samples=400, refine_steps=40):
+    """
+    Return all intersection points between the segment p0->p1 and the
+    superquadric surface in local coordinates.
+
+    Returns:
+        hits: (K,3) array, with K = 0, 1, or 2 typically
+        t_hits: (K,) parameter values in [0,1]
+    """
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+
+    e1, e2 = float(theta[0]), float(theta[1])
+    a1 = max(abs(float(theta[2])), 1e-6)
+    a2 = max(abs(float(theta[3])), 1e-6)
+    a3 = max(abs(float(theta[4])), 1e-6)
+
+    def F(p):
+        x, y, z = p
+        term1 = (abs(x / a1) ** (2.0 / e2) + abs(y / a2) ** (2.0 / e2)) ** (e2 / e1)
+        term2 = abs(z / a3) ** (2.0 / e1)
+        return term1 + term2 - 1.0
+
+    ts = np.linspace(0.0, 1.0, samples)
+    vals = np.array([F(p0 + t * (p1 - p0)) for t in ts])
+
+    # detect intervals with sign change or exact zeros
+    candidate_intervals = []
+    for i in range(len(ts) - 1):
+        v0, v1 = vals[i], vals[i + 1]
+
+        if abs(v0) < 1e-10:
+            candidate_intervals.append((ts[i], ts[i]))
+        elif v0 * v1 < 0 or abs(v1) < 1e-10:
+            candidate_intervals.append((ts[i], ts[i + 1]))
+
+    t_hits = []
+
+    for a, b in candidate_intervals:
+        if a == b:
+            t_hit = a
+        else:
+            fa = F(p0 + a * (p1 - p0))
+            fb = F(p0 + b * (p1 - p0))
+
+            for _ in range(refine_steps):
+                m = 0.5 * (a + b)
+                fm = F(p0 + m * (p1 - p0))
+
+                if abs(fm) < 1e-12:
+                    a = b = m
+                    break
+
+                if fa * fm <= 0:
+                    b = m
+                    fb = fm
+                else:
+                    a = m
+                    fa = fm
+
+            t_hit = 0.5 * (a + b)
+
+        # avoid duplicates from neighboring intervals
+        if not any(abs(t_hit - t_old) < 1e-6 for t_old in t_hits):
+            t_hits.append(t_hit)
+
+    t_hits = np.array(sorted(t_hits))
+    hits = np.array([p0 + t * (p1 - p0) for t in t_hits])
+
+    return hits, t_hits
+
+def is_antipodal(normals_contact_point, tol_dot=-0.99):
+    """
+    normals_contact_point: (2,3), outward normals at the two contacts
+    tol_dot: threshold for antipodality
+             -1.0 = perfectly opposite
+             e.g. -0.95 means angle > about 162 deg
+    """
+    n1 = normals_contact_point[0]
+    n2 = normals_contact_point[1]
+
+    n1 = n1 / (np.linalg.norm(n1) + 1e-12)
+    n2 = n2 / (np.linalg.norm(n2) + 1e-12)
+
+    dot = np.dot(n1, n2)
+    return dot <= tol_dot, dot
+
 # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
 # # theta_box = [0.2, 0.2, 1.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 # # theta_cylinder = [0.2, 1.0, 1.0, 1.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0]
@@ -647,192 +782,192 @@ def prune_indices_voxel(points, voxel=0.02):
 # draw_segments_mlab(segs_local, tube_radius=0.003)
 # mlab.show()
 
-print("ONLY a1 < MAX_WIDTH/2")
-theta_ellipsoid = [1.0, 1.0, 0.07, 0.3, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-pts_grasp_local, approach_dir_local, closing_axis, info = grasp_candidate_positions_from_theta(theta_ellipsoid, MAX_GRIPPER_WIDTH/2, 50)
-gripper_segs = gripper_lines_local_3d_independent(
-    jaw_top=0.08,      # top finger opened more
-    jaw_bottom=0.08,   # bottom finger opened less
-    jaw_length=0.1,
-    back_length=0.0,
-    wrist_length=0.06
-)
+# print("ONLY a1 < MAX_WIDTH/2")
+# theta_ellipsoid = [1.0, 1.0, 0.07, 0.3, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# pts_grasp_local, approach_dir_local, closing_axis, info = grasp_candidate_positions_from_theta(theta_ellipsoid, MAX_GRIPPER_WIDTH/2, 50)
+# gripper_segs = gripper_lines_local_3d_independent(
+#     jaw_top=0.08,      # top finger opened more
+#     jaw_bottom=0.08,   # bottom finger opened less
+#     jaw_length=0.1,
+#     back_length=0.0,
+#     wrist_length=0.06
+# )
 
 
-t_grasp_poses = []
-rot_grasp_poses = []
-for i in range(0, len(pts_grasp_local), 5):
-    t_grasp_poses.append(pts_grasp_local[i])
-    rot_grasp_poses.append(rotation_from_xy(approach_dir_local[i], closing_axis))
-
-
-
-fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-plot_functions.showSuperquadrics(theta_ellipsoid)
-plot_functions.showPoints(pts_grasp_local, scale_factor=0.01, figure=fig)
-standoff = -0.1  # 5 cm outside
-p_pre_local = pts_grasp_local + standoff * approach_dir_local
-plot_functions.show_vectors(p_pre_local, pts_grasp_local, mode='arrow', every=4, color=(0,1,0), scale_factor=1.0, figure=fig)
-for i in range(0, len(t_grasp_poses)):
-    gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_grasp_poses[i])
-    draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
-origin = np.array([[0, 0, 0]])
-x_axis = np.array([[1, 0, 0]])
-y_axis = np.array([[0, 1, 0]])
-z_axis = np.array([[0, 0, 1]])
-plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
-mlab.show()
-
-print("ONLY a2 < MAX_WIDTH/2")
-theta_ellipsoid_A2 = [1.0, 1.0, 0.3, 0.07, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-pts_grasp_local, approach_dir_local, closing_axis, info = grasp_candidate_positions_from_theta(theta_ellipsoid_A2, MAX_GRIPPER_WIDTH/2, 50)
-gripper_segs = gripper_lines_local_3d_independent(
-    jaw_top=0.08,      # top finger opened more
-    jaw_bottom=0.08,   # bottom finger opened less
-    jaw_length=0.1,
-    back_length=0.0,
-    wrist_length=0.06
-)
-
-
-t_grasp_poses = []
-rot_grasp_poses = []
-for i in range(0, len(pts_grasp_local), 5):
-    t_grasp_poses.append(pts_grasp_local[i])
-    rot_grasp_poses.append(rotation_from_xy(approach_dir_local[i], closing_axis))
+# t_grasp_poses = []
+# rot_grasp_poses = []
+# for i in range(0, len(pts_grasp_local), 5):
+#     t_grasp_poses.append(pts_grasp_local[i])
+#     rot_grasp_poses.append(rotation_from_xy(approach_dir_local[i], closing_axis))
 
 
 
-fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-plot_functions.showSuperquadrics(theta_ellipsoid_A2)
-plot_functions.showPoints(pts_grasp_local, scale_factor=0.01, figure=fig)
-standoff = -0.1  # 5 cm outside
-p_pre_local = pts_grasp_local + standoff * approach_dir_local
-plot_functions.show_vectors(p_pre_local, pts_grasp_local, mode='arrow', every=4, color=(0,1,0), scale_factor=1.0, figure=fig)
-for i in range(0, len(t_grasp_poses)):
-    gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_grasp_poses[i])
-    draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
-origin = np.array([[0, 0, 0]])
-x_axis = np.array([[1, 0, 0]])
-y_axis = np.array([[0, 1, 0]])
-z_axis = np.array([[0, 0, 1]])
-plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
-mlab.show()
+# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# plot_functions.showSuperquadrics(theta_ellipsoid)
+# plot_functions.showPoints(pts_grasp_local, scale_factor=0.01, figure=fig)
+# standoff = -0.1  # 5 cm outside
+# p_pre_local = pts_grasp_local + standoff * approach_dir_local
+# plot_functions.show_vectors(p_pre_local, pts_grasp_local, mode='arrow', every=4, color=(0,1,0), scale_factor=1.0, figure=fig)
+# for i in range(0, len(t_grasp_poses)):
+#     gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_grasp_poses[i])
+#     draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
+# origin = np.array([[0, 0, 0]])
+# x_axis = np.array([[1, 0, 0]])
+# y_axis = np.array([[0, 1, 0]])
+# z_axis = np.array([[0, 0, 1]])
+# plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
+# mlab.show()
 
-print("ONLY a3 < MAX_WIDTH/2")
-theta_ellipsoid_A3 = [0.2, 0.2, 0.3, 0.2, 0.07, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-pts_grasp_local, approach_dir_local, closing_axis, info = grasp_candidate_positions_from_theta(theta_ellipsoid_A3, MAX_GRIPPER_WIDTH/2, 100)
-gripper_segs = gripper_lines_local_3d_independent(
-    jaw_top=0.1,      # top finger opened more
-    jaw_bottom=0.1,   # bottom finger opened less
-    jaw_length=0.1,
-    back_length=0.0,
-    wrist_length=0.06
-)
-
-
-t_grasp_poses = []
-rot_grasp_poses = []
-for i in range(0, len(pts_grasp_local), 10):
-    t_grasp_poses.append(pts_grasp_local[i])
-    rot_grasp_poses.append(rotation_from_xy(approach_dir_local[i], closing_axis))
+# print("ONLY a2 < MAX_WIDTH/2")
+# theta_ellipsoid_A2 = [1.0, 1.0, 0.3, 0.07, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# pts_grasp_local, approach_dir_local, closing_axis, info = grasp_candidate_positions_from_theta(theta_ellipsoid_A2, MAX_GRIPPER_WIDTH/2, 50)
+# gripper_segs = gripper_lines_local_3d_independent(
+#     jaw_top=0.08,      # top finger opened more
+#     jaw_bottom=0.08,   # bottom finger opened less
+#     jaw_length=0.1,
+#     back_length=0.0,
+#     wrist_length=0.06
+# )
 
 
+# t_grasp_poses = []
+# rot_grasp_poses = []
+# for i in range(0, len(pts_grasp_local), 5):
+#     t_grasp_poses.append(pts_grasp_local[i])
+#     rot_grasp_poses.append(rotation_from_xy(approach_dir_local[i], closing_axis))
 
-fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-plot_functions.showSuperquadrics(theta_ellipsoid_A3)
-plot_functions.showPoints(pts_grasp_local, scale_factor=0.01, figure=fig)
-standoff = -0.1  # 5 cm outside
-p_pre_local = pts_grasp_local + standoff * approach_dir_local
-plot_functions.show_vectors(p_pre_local, pts_grasp_local, mode='arrow', every=4, color=(0,1,0), scale_factor=1.0, figure=fig)
-for i in range(0, len(t_grasp_poses)):
-    gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_grasp_poses[i])
-    draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
-origin = np.array([[0, 0, 0]])
-x_axis = np.array([[1, 0, 0]])
-y_axis = np.array([[0, 1, 0]])
-z_axis = np.array([[0, 0, 1]])
-plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
-mlab.show()
 
-print("A1 and A2 < MAX_WIDTH/2")
-theta_ellipsoid_A1A2 = [0.60, 0.60, 0.1, 0.05, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-gripper_segs = gripper_lines_local_3d_independent(
-    jaw_top=0.08,      # top finger opened more
-    jaw_bottom=0.08,   # bottom finger opened less
-    jaw_length=0.1,
-    back_length=0.0,
-    wrist_length=0.06
-)
-finger_segs = [gripper_segs[2], gripper_segs[3]]
-pts_full_surface_local = sample_superquadric_rings(theta_ellipsoid_A1A2, 20, 200, True, 'z')
-local_nrm_out = superellipsoid_normals_local(pts_full_surface_local, theta_ellipsoid_A1A2)                      # local normals
-tangent = tangent_closest_to_axis(-local_nrm_out, axis=np.array([0,0,1]))
-rot_local = []
-for i in range(len(tangent)):
-    aux_rot_local = rotation_from_xz(-local_nrm_out[i], tangent[i])
-    rot_local.append(aux_rot_local)
+
+# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# plot_functions.showSuperquadrics(theta_ellipsoid_A2)
+# plot_functions.showPoints(pts_grasp_local, scale_factor=0.01, figure=fig)
+# standoff = -0.1  # 5 cm outside
+# p_pre_local = pts_grasp_local + standoff * approach_dir_local
+# plot_functions.show_vectors(p_pre_local, pts_grasp_local, mode='arrow', every=4, color=(0,1,0), scale_factor=1.0, figure=fig)
+# for i in range(0, len(t_grasp_poses)):
+#     gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_grasp_poses[i])
+#     draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
+# origin = np.array([[0, 0, 0]])
+# x_axis = np.array([[1, 0, 0]])
+# y_axis = np.array([[0, 1, 0]])
+# z_axis = np.array([[0, 0, 1]])
+# plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
+# mlab.show()
+
+# print("ONLY a3 < MAX_WIDTH/2")
+# theta_ellipsoid_A3 = [0.2, 0.2, 0.3, 0.2, 0.07, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# pts_grasp_local, approach_dir_local, closing_axis, info = grasp_candidate_positions_from_theta(theta_ellipsoid_A3, MAX_GRIPPER_WIDTH/2, 100)
+# gripper_segs = gripper_lines_local_3d_independent(
+#     jaw_top=0.1,      # top finger opened more
+#     jaw_bottom=0.1,   # bottom finger opened less
+#     jaw_length=0.1,
+#     back_length=0.0,
+#     wrist_length=0.06
+# )
+
+
+# t_grasp_poses = []
+# rot_grasp_poses = []
+# for i in range(0, len(pts_grasp_local), 10):
+#     t_grasp_poses.append(pts_grasp_local[i])
+#     rot_grasp_poses.append(rotation_from_xy(approach_dir_local[i], closing_axis))
+
+
+
+# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# plot_functions.showSuperquadrics(theta_ellipsoid_A3)
+# plot_functions.showPoints(pts_grasp_local, scale_factor=0.01, figure=fig)
+# standoff = -0.1  # 5 cm outside
+# p_pre_local = pts_grasp_local + standoff * approach_dir_local
+# plot_functions.show_vectors(p_pre_local, pts_grasp_local, mode='arrow', every=4, color=(0,1,0), scale_factor=1.0, figure=fig)
+# for i in range(0, len(t_grasp_poses)):
+#     gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_grasp_poses[i])
+#     draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
+# origin = np.array([[0, 0, 0]])
+# x_axis = np.array([[1, 0, 0]])
+# y_axis = np.array([[0, 1, 0]])
+# z_axis = np.array([[0, 0, 1]])
+# plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
+# mlab.show()
+
+# print("A1 and A2 < MAX_WIDTH/2")
+# theta_ellipsoid_A1A2 = [0.60, 0.60, 0.1, 0.05, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# gripper_segs = gripper_lines_local_3d_independent(
+#     jaw_top=0.08,      # top finger opened more
+#     jaw_bottom=0.08,   # bottom finger opened less
+#     jaw_length=0.1,
+#     back_length=0.0,
+#     wrist_length=0.06
+# )
+# finger_segs = [gripper_segs[2], gripper_segs[3]]
+# pts_full_surface_local = sample_superquadric_rings(theta_ellipsoid_A1A2, 20, 200, True, 'z')
+# local_nrm_out = superellipsoid_normals_local(pts_full_surface_local, theta_ellipsoid_A1A2)                      # local normals
+# tangent = tangent_closest_to_axis(-local_nrm_out, axis=np.array([0,0,1]))
+# rot_local = []
+# for i in range(len(tangent)):
+#     aux_rot_local = rotation_from_xz(-local_nrm_out[i], tangent[i])
+#     rot_local.append(aux_rot_local)
     
-is_face, cap_r = cap_is_face_like(theta_ellipsoid_A1A2, delta=0.01, min_cap_radius=0.0)
-if is_face:
-    pts_local_planexz = sample_sq_section_local_numpy_uniform(theta_ellipsoid_A1A2, plane='y', n_points=50)
-    pts_local_planexz = filter_points_near_caps(pts_local_planexz, theta_ellipsoid_A1A2[4], tol=0.10)
-    local_nrm_out_planexz = superellipsoid_normals_local(pts_local_planexz, theta_ellipsoid_A1A2)                      # local normals
-    local_nrm_out = np.vstack([local_nrm_out, local_nrm_out_planexz])
-    for i in range(len(local_nrm_out_planexz)):
-        rot_local.append(rotation_from_xy(-local_nrm_out_planexz[i], np.array([0,1,0])))
-    pts_all = np.vstack([pts_full_surface_local, pts_local_planexz])
+# is_face, cap_r = cap_is_face_like(theta_ellipsoid_A1A2, delta=0.01, min_cap_radius=0.0)
+# if is_face:
+#     pts_local_planexz = sample_sq_section_local_numpy_uniform(theta_ellipsoid_A1A2, plane='y', n_points=50)
+#     pts_local_planexz = filter_points_near_caps(pts_local_planexz, theta_ellipsoid_A1A2[4], tol=0.10)
+#     local_nrm_out_planexz = superellipsoid_normals_local(pts_local_planexz, theta_ellipsoid_A1A2)                      # local normals
+#     local_nrm_out = np.vstack([local_nrm_out, local_nrm_out_planexz])
+#     for i in range(len(local_nrm_out_planexz)):
+#         rot_local.append(rotation_from_xy(-local_nrm_out_planexz[i], np.array([0,1,0])))
+#     pts_all = np.vstack([pts_full_surface_local, pts_local_planexz])
     
-    pts_local_planeyz = sample_sq_section_local_numpy_uniform(theta_ellipsoid_A1A2, plane='x', n_points=50)
-    pts_local_planeyz = filter_points_near_caps(pts_local_planeyz, theta_ellipsoid_A1A2[4], tol=0.10)
-    local_nrm_out_planeyz = superellipsoid_normals_local(pts_local_planeyz, theta_ellipsoid_A1A2)                      # local normals
-    local_nrm_out = np.vstack([local_nrm_out, local_nrm_out_planeyz])
-    for i in range(len(local_nrm_out_planexz)):
-        rot_local.append(rotation_from_xy(-local_nrm_out_planexz[i], np.array([1,0,0])))
-    pts_all = np.vstack([pts_all, pts_local_planeyz])
-else:
-    print("Top/Bottom really rounded. Not grasp from here.")
-print("is_face: ", is_face, cap_r)
+#     pts_local_planeyz = sample_sq_section_local_numpy_uniform(theta_ellipsoid_A1A2, plane='x', n_points=50)
+#     pts_local_planeyz = filter_points_near_caps(pts_local_planeyz, theta_ellipsoid_A1A2[4], tol=0.10)
+#     local_nrm_out_planeyz = superellipsoid_normals_local(pts_local_planeyz, theta_ellipsoid_A1A2)                      # local normals
+#     local_nrm_out = np.vstack([local_nrm_out, local_nrm_out_planeyz])
+#     for i in range(len(local_nrm_out_planexz)):
+#         rot_local.append(rotation_from_xy(-local_nrm_out_planexz[i], np.array([1,0,0])))
+#     pts_all = np.vstack([pts_all, pts_local_planeyz])
+# else:
+#     print("Top/Bottom really rounded. Not grasp from here.")
+# print("is_face: ", is_face, cap_r)
 
-t_pregrasp_poses = []
-t_grasp_poses = []
-rot_grasp_poses = []
-for i in range(0, len(pts_all), 1):
-    if not fingers_collide_sq_local(finger_segs, rot_local[i], pts_all[i], theta_ellipsoid_A1A2, 15):
-        t_grasp_poses.append(pts_all[i])
-        rot_grasp_poses.append(rot_local[i])
-        t_pregrasp_poses.append(pts_all[i]+0.1*local_nrm_out[i])
+# t_pregrasp_poses = []
+# t_grasp_poses = []
+# rot_grasp_poses = []
+# for i in range(0, len(pts_all), 1):
+#     if not fingers_collide_sq_local(finger_segs, rot_local[i], pts_all[i], theta_ellipsoid_A1A2, 15):
+#         t_grasp_poses.append(pts_all[i])
+#         rot_grasp_poses.append(rot_local[i])
+#         t_pregrasp_poses.append(pts_all[i]+0.1*local_nrm_out[i])
         
 
 
-fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-plot_functions.showSuperquadrics(theta_ellipsoid_A1A2)
-plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
-plot_functions.showPoints(pts_all, scale_factor=0.01, figure=fig)
-plot_functions.showPoints(np.array(t_grasp_poses), scale_factor=0.01, color=(0,0,1), figure=fig)
-for i in range(0, len(t_grasp_poses), 5):
-    gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_pregrasp_poses[i])
-    draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
+# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# plot_functions.showSuperquadrics(theta_ellipsoid_A1A2)
+# plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
+# plot_functions.showPoints(pts_all, scale_factor=0.01, figure=fig)
+# plot_functions.showPoints(np.array(t_grasp_poses), scale_factor=0.01, color=(0,0,1), figure=fig)
+# for i in range(0, len(t_grasp_poses), 5):
+#     gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_pregrasp_poses[i])
+#     draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
 
-# approach_dir = -local_nrm_out
+# # approach_dir = -local_nrm_out
 
-# standoff = -0.1  # 5 cm outside
-# p_pre_local = pts_all+ standoff * approach_dir
-# plot_functions.show_vectors(p_pre_local, pts_all, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
-
-
-mlab.show()
+# # standoff = -0.1  # 5 cm outside
+# # p_pre_local = pts_all+ standoff * approach_dir
+# # plot_functions.show_vectors(p_pre_local, pts_all, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
 
 
-theta_ellipsoid_A1A2 = [0.60, 0.60, 0.1, 0.05, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# mlab.show()
+
+
+theta_ellipsoid_A1A2 = [0.2, 0.2, 0.1, 0.07, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 gripper_segs = gripper_lines_local_3d_independent(
     jaw_top=0.08,      # top finger opened more
     jaw_bottom=0.08,   # bottom finger opened less
@@ -843,14 +978,14 @@ gripper_segs = gripper_lines_local_3d_independent(
 finger_segs = [gripper_segs[2], gripper_segs[3]]
 rot_local = []
 
-pts_full_surface_local_x = sample_superquadric_rings(theta_ellipsoid_A1A2, 20, 200, True, 'x')
+pts_full_surface_local_x = sample_superquadric_rings(theta_ellipsoid_A1A2, 60, 300, True, 'x')
 local_nrm_out_x = superellipsoid_normals_local(pts_full_surface_local_x, theta_ellipsoid_A1A2)                      # local normals
 tangent_x = tangent_closest_to_axis(-local_nrm_out_x, axis=np.array([1,0,0]))
 for i in range(len(tangent_x)):
     aux_rot_local = rotation_from_xz(-local_nrm_out_x[i], tangent_x[i])
     rot_local.append(aux_rot_local)
 
-pts_full_surface_local_z = sample_superquadric_rings(theta_ellipsoid_A1A2, 20, 200, True, 'z')
+pts_full_surface_local_z = sample_superquadric_rings(theta_ellipsoid_A1A2, 60, 300, True, 'z')
 local_nrm_out_z = superellipsoid_normals_local(pts_full_surface_local_z, theta_ellipsoid_A1A2)                      # local normals
 tangent_z = tangent_closest_to_axis(-local_nrm_out_z, axis=np.array([0,0,1]))
 
@@ -858,7 +993,7 @@ for i in range(len(tangent_z)):
     aux_rot_local = rotation_from_xz(-local_nrm_out_z[i], tangent_z[i])
     rot_local.append(aux_rot_local)
 
-pts_full_surface_local_y = sample_superquadric_rings(theta_ellipsoid_A1A2, 20, 200, True, 'y')
+pts_full_surface_local_y = sample_superquadric_rings(theta_ellipsoid_A1A2, 60, 300, True, 'y')
 local_nrm_out_y = superellipsoid_normals_local(pts_full_surface_local_y, theta_ellipsoid_A1A2)                      # local normals
 tangent_y = tangent_closest_to_axis(-local_nrm_out_y, axis=np.array([0,1,0]))
 
@@ -872,7 +1007,7 @@ local_nrm_out = np.vstack([local_nrm_out_x, local_nrm_out_z, local_nrm_out_y])
 pts_full_local = np.vstack([pts_full_surface_local_x, pts_full_surface_local_z, pts_full_surface_local_y])
 
 print(pts_full_local)
-idx = prune_indices_voxel(pts_full_local, 0.01)
+idx = prune_indices_voxel(pts_full_local, 0.008)
 local_nrm_out = local_nrm_out[idx]
 pts_full_local = pts_full_local[idx]
 rot_local = np.stack(rot_local)   
@@ -888,15 +1023,77 @@ for i in range(0, len(pts_full_local), 1):
         rot_grasp_poses.append(rot_local[i])
         t_pregrasp_poses.append(pts_full_local[i]+0.1*local_nrm_out[i])
         
-print("aquiiiii")
+origin = np.array([[0, 0, 0]])
+x_axis = np.array([[1, 0, 0]])
+y_axis = np.array([[0, 1, 0]])
+z_axis = np.array([[0, 0, 1]])
+
 fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
 plot_functions.showSuperquadrics(theta_ellipsoid_A1A2)
 plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
 plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
 plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
-plot_functions.showPoints(pts_full_local, scale_factor=0.01, figure=fig)
+plot_functions.showPoints(pts_full_local, scale_factor=0.005, figure=fig)
 plot_functions.showPoints(np.array(t_grasp_poses), scale_factor=0.01, color=(0,0,1), figure=fig)
-for i in range(0, len(t_grasp_poses), 10):
+for i in range(0, len(t_grasp_poses), 30):
     gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_pregrasp_poses[i])
     draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
 mlab.show()
+
+t_new_grasp_poses = []
+rot_new_grasp_poses = []
+center_points = []
+for i in range(0, len(t_grasp_poses), 1):
+    pts_top, pts_bot, dists_seg = fingers_sample_pairs_local(finger_segs, rot_grasp_poses[i], t_grasp_poses[i], 15)
+    already_added_center_point = False
+    for pt_top, pt_bot, dist_seg in zip(pts_top, pts_bot, dists_seg):
+      hits, t_hits = intersect_segment_superquadric_all(pt_top, pt_bot, theta_ellipsoid_A1A2)
+      if len(hits) == 0:
+          print("No hit, expeted if the fingers are too long and the supershape is small in the clossing direction")
+      elif len(hits) == 1:
+          print("Just one should be at the grasp pose or if the fingers are too long and the supershape is small in the closing direction")
+      else:
+          pt_contact1 = hits[0]
+          pt_contact2 = hits[1]
+          
+          normals_contact_point = superellipsoid_normals_local(hits, theta_ellipsoid_A1A2)
+
+          ok_antipodal, dot_val = is_antipodal(normals_contact_point, tol_dot=-0.95)
+          
+          if ok_antipodal:
+              print("Dist_seg: ", dist_seg)
+              if dist_seg>=0.08:
+                  t_new = t_grasp_poses[i] + rot_grasp_poses[i] @ np.array([dist_seg,0,0])
+                  R_new = rot_grasp_poses[i]
+                  t_new_grasp_poses.append(t_new)
+                  rot_new_grasp_poses.append(R_new)
+                  center_points.append(t_grasp_poses[i])
+                  already_added_center_point = False
+
+
+fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+plot_functions.showSuperquadrics(theta_ellipsoid_A1A2)
+plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
+plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
+plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
+plot_functions.showPoints(pts_full_local, scale_factor=0.005, figure=fig)
+plot_functions.showPoints(np.array(center_points), scale_factor=0.01, color=(0,0,1), figure=fig)
+for i in range(0, len(t_new_grasp_poses), 50):
+    gripper_at_pose = transform_lines_3d(gripper_segs, rot_new_grasp_poses[i], t_new_grasp_poses[i])
+    draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
+mlab.show()
+
+
+# theta = [0.4, 0.1, 0.07, 0.07, 0.3, 0, 0, 0, 0, 0, 0]
+
+# p0 = np.array([-0.2, 0.0, 0.0])
+# p1 = np.array([ 0.2, 0.0, 0.0])
+
+# hits, t_hits = intersect_segment_superquadric_all(p0, p1, theta)
+
+# print("t_hits:", t_hits)
+# print("hits:\n", hits)
+
+# local_nrm_out_hits = superellipsoid_normals_local(hits, theta)                      # local normals
+
+# print("normals: ", local_nrm_out_hits)
