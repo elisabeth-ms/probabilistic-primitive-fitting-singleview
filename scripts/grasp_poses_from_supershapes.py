@@ -4,12 +4,76 @@ import numpy as np
 import psqf
 import torch
 import superellipsoid_tools
-
-
+from collections import defaultdict
+import json
 
 
 
 import numpy as np
+
+# def gripper_lines_local_3d_independent(
+#     jaw_top=0.04,
+#     jaw_bottom=0.04,
+#     jaw_length=0.12,
+#     back_length=0.06,
+#     wrist_length=0.05,
+#     pad_width=0.03
+# ):
+
+#     L = float(jaw_length)
+#     B = float(back_length)
+#     W = float(wrist_length)
+
+#     y_top = +jaw_top
+#     y_bot = -jaw_bottom
+
+#     x_left  = -B
+#     x_right = L
+
+#     z_left  = -pad_width/2
+#     z_right = +pad_width/2
+
+#     segs = []
+#     top_finger = []
+#     bottom_finger = []
+
+#     # wrist
+#     segs.append((np.array([x_left - W, 0, 0]),
+#                  np.array([x_left, 0, 0])))
+
+#     # back connector
+#     segs.append((np.array([x_left, y_bot, 0]),
+#                  np.array([x_left, y_top, 0])))
+
+#    # ----- top finger rectangle -----
+
+#     s = (np.array([x_right, y_top, z_left]), np.array([x_right, y_top, z_right]))
+#     segs.append(s); top_finger.append(s)
+
+#     s = (np.array([x_left, y_top, z_left]), np.array([x_left, y_top, z_right]))
+#     segs.append(s); top_finger.append(s)
+
+#     s = (np.array([x_left, y_top, z_left]), np.array([x_right, y_top, z_left]))
+#     segs.append(s); top_finger.append(s)
+
+#     s = (np.array([x_left, y_top, z_right]), np.array([x_right, y_top, z_right]))
+#     segs.append(s); top_finger.append(s)
+
+#     # ----- bottom finger rectangle -----
+
+#     s = (np.array([x_right, y_bot, z_left]), np.array([x_right, y_bot, z_right]))
+#     segs.append(s); bottom_finger.append(s)
+
+#     s = (np.array([x_left, y_bot, z_left]), np.array([x_left, y_bot, z_right]))
+#     segs.append(s); bottom_finger.append(s)
+
+#     s = (np.array([x_left, y_bot, z_left]), np.array([x_right, y_bot, z_left]))
+#     segs.append(s); bottom_finger.append(s)
+
+#     s = (np.array([x_left, y_bot, z_right]), np.array([x_right, y_bot, z_right]))
+#     segs.append(s); bottom_finger.append(s)
+
+#     return segs, top_finger, bottom_finger
 
 def gripper_lines_local_3d_independent(
     jaw_top=0.04,
@@ -32,6 +96,7 @@ def gripper_lines_local_3d_independent(
 
     z_left  = -pad_width/2
     z_right = +pad_width/2
+    z_mid   = 0.0   # center of pad
 
     segs = []
     top_finger = []
@@ -59,6 +124,10 @@ def gripper_lines_local_3d_independent(
     s = (np.array([x_left, y_top, z_right]), np.array([x_right, y_top, z_right]))
     segs.append(s); top_finger.append(s)
 
+    # NEW: center line of top pad
+    s = (np.array([x_left, y_top, z_mid]), np.array([x_right, y_top, z_mid]))
+    segs.append(s); top_finger.append(s)
+
     # ----- bottom finger rectangle -----
 
     s = (np.array([x_right, y_bot, z_left]), np.array([x_right, y_bot, z_right]))
@@ -73,9 +142,11 @@ def gripper_lines_local_3d_independent(
     s = (np.array([x_left, y_bot, z_right]), np.array([x_right, y_bot, z_right]))
     segs.append(s); bottom_finger.append(s)
 
-    return segs, top_finger, bottom_finger
+    # NEW: center line of bottom pad
+    s = (np.array([x_left, y_bot, z_mid]), np.array([x_right, y_bot, z_mid]))
+    segs.append(s); bottom_finger.append(s)
 
-import numpy as np
+    return segs, top_finger, bottom_finger
 
 def sample_pad_pairs_local(
     x_left,
@@ -1260,351 +1331,919 @@ def tangent_candidates_from_axes(
         tangent_lists.append(tangents_i)
 
     return tangent_lists
-  
-MAX_GRIPPER_WIDTH = 0.19
-jaw_top = 0.1
-jaw_bottom = 0.1
-jaw_length = 0.1
-back_length = 0.0
-wrist_length = 0.06
-pad_width = 0.03
-tol_contact = 0.001   # example: 2 mm
-tol_dot = -0.99       # antipodal threshold
-theta_ellipsoid_A1A2 = [0.1, 0.1, 0.04, 0.15, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-#theta_ellipsoid_A1A2 = [0.2, 1.0, 0.08, 0.08, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-n_rotations = 4
-gripper_segs, top_pad_segs, bottom_pad_segs = gripper_lines_local_3d_independent(
-    jaw_top=jaw_top,      # top finger opened more
-    jaw_bottom=jaw_bottom,   # bottom finger opened less
-    jaw_length=jaw_length,
-    back_length=back_length,
-    wrist_length=wrist_length,
-    pad_width=pad_width
-)
 
-x_left = -back_length
-x_right = jaw_length
-y_top = jaw_top
-y_bot = -jaw_bottom
-z_left = -pad_width / 2
-z_right = pad_width / 2
+def angle_close_from_dot(a, b, cos_thresh):
+    a = a / (np.linalg.norm(a) + 1e-12)
+    b = b / (np.linalg.norm(b) + 1e-12)
+    return np.dot(a, b) >= cos_thresh
+
+def candidate_priority(p, zero_tol=1e-6):
+    """
+    Higher priority = better candidate to keep.
+    Preference:
+      1) any coordinate near zero
+      2) more coordinates near zero
+      3) closer to a symmetry plane
+      4) closer to origin
+    """
+    p = np.asarray(p, dtype=float)
+    abs_p = np.abs(p)
+
+    any_zero = int(np.any(abs_p < zero_tol))
+    n_zero = int(np.sum(abs_p < zero_tol))
+    min_abs = float(np.min(abs_p))
+    origin_dist = float(np.linalg.norm(p))
+
+    return (any_zero, n_zero, -min_abs, -origin_dist)
+
+def prune_candidates_prefer_axis_zero(
+    positions,
+    approach_dirs,
+    pos_thresh=0.01,
+    ang_thresh_deg=10.0,
+    zero_tol=1e-6
+):
+    """
+    Remove near-duplicate candidate positions while preferring candidates
+    lying on x=0, y=0, or z=0 planes.
+
+    Two candidates are considered duplicates only if:
+      - position distance <= pos_thresh
+      - approach angle <= ang_thresh_deg
+
+    Among duplicates, keep the one with highest candidate_priority().
+
+    Returns:
+      keep_idx : np.ndarray of kept indices
+    """
+    P = np.asarray(positions, dtype=float)
+    A = np.asarray(approach_dirs, dtype=float)
+
+    N = len(P)
+    if N == 0:
+        return np.array([], dtype=int)
+
+    # normalize approach directions once
+    A = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
+
+    cos_thresh = np.cos(np.deg2rad(ang_thresh_deg))
+
+    # spatial hash
+    inv = 1.0 / pos_thresh
+    keys = np.floor(P * inv).astype(np.int64)
+
+    grid = defaultdict(list)
+    for i, k in enumerate(keys):
+        grid[tuple(k)].append(i)
+
+    # process better candidates first
+    priorities = [candidate_priority(P[i], zero_tol=zero_tol) for i in range(N)]
+    order = sorted(range(N), key=lambda i: priorities[i], reverse=True)
+
+    kept = []
+    suppressed = np.zeros(N, dtype=bool)
+
+    neighbor_offsets = [(dx, dy, dz)
+                        for dx in (-1, 0, 1)
+                        for dy in (-1, 0, 1)
+                        for dz in (-1, 0, 1)]
+
+    for i in order:
+        if suppressed[i]:
+            continue
+
+        kept.append(i)
+
+        cell = tuple(keys[i])
+
+        # suppress nearby candidates with similar approach direction
+        for off in neighbor_offsets:
+            neigh = (cell[0] + off[0], cell[1] + off[1], cell[2] + off[2])
+
+            for j in grid.get(neigh, []):
+                if j == i or suppressed[j]:
+                    continue
+
+                if np.linalg.norm(P[j] - P[i]) > pos_thresh:
+                    continue
+
+                if not angle_close_from_dot(A[i], A[j], cos_thresh):
+                    continue
+
+                suppressed[j] = True
+
+    kept = np.array(sorted(kept), dtype=int)
+    return kept
+
+def rotation_matrix_to_quaternion(R):
+    """
+    Convert 3x3 rotation matrix to quaternion (x, y, z, w)
+    """
+    R = np.asarray(R, dtype=float)
+
+    trace = np.trace(R)
+
+    if trace > 0:
+        s = np.sqrt(trace + 1.0) * 2
+        qw = 0.25 * s
+        qx = (R[2,1] - R[1,2]) / s
+        qy = (R[0,2] - R[2,0]) / s
+        qz = (R[1,0] - R[0,1]) / s
+    else:
+        if R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+            s = np.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2]) * 2
+            qw = (R[2,1] - R[1,2]) / s
+            qx = 0.25 * s
+            qy = (R[0,1] + R[1,0]) / s
+            qz = (R[0,2] + R[2,0]) / s
+        elif R[1,1] > R[2,2]:
+            s = np.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2]) * 2
+            qw = (R[0,2] - R[2,0]) / s
+            qx = (R[0,1] + R[1,0]) / s
+            qy = 0.25 * s
+            qz = (R[1,2] + R[2,1]) / s
+        else:
+            s = np.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1]) * 2
+            qw = (R[1,0] - R[0,1]) / s
+            qx = (R[0,2] + R[2,0]) / s
+            qy = (R[1,2] + R[2,1]) / s
+            qz = 0.25 * s
+
+    return np.array([qx, qy, qz, qw])
 
 
 
-finger_segs = top_pad_segs + bottom_pad_segs
-rot_local = []
-
-# pts_full_surface_local_x = superellipsoid_tools.sample_superquadric_rings(theta_ellipsoid_A1A2, 40, 30, True, 'x')
-# local_nrm_out_x = superellipsoid_tools.superellipsoid_normals_local(pts_full_surface_local_x, theta_ellipsoid_A1A2)                      # local normals
-# tangent_x = tangent_closest_to_axis(-local_nrm_out_x, axis=np.array([1,0,0]))
-# for i in range(len(tangent_x)):
-#     aux_rot_local = rotation_from_xz(-local_nrm_out_x[i], tangent_x[i])
-#     rot_local.append(aux_rot_local)
-
-# pts_full_surface_local_z = superellipsoid_tools.sample_superquadric_rings(theta_ellipsoid_A1A2, 40, 30, True, 'z')
-# local_nrm_out_z = superellipsoid_tools.superellipsoid_normals_local(pts_full_surface_local_z, theta_ellipsoid_A1A2)                      # local normals
-# tangent_z = tangent_closest_to_axis(-local_nrm_out_z, axis=np.array([0,0,1]))
-
-# for i in range(len(tangent_z)):
-#     aux_rot_local = rotation_from_xz(-local_nrm_out_z[i], tangent_z[i])
-#     rot_local.append(aux_rot_local)
-
-# pts_full_surface_local_y = superellipsoid_tools.sample_superquadric_rings(theta_ellipsoid_A1A2, 40, 30, True, 'y')
-# local_nrm_out_y = superellipsoid_tools.superellipsoid_normals_local(pts_full_surface_local_y, theta_ellipsoid_A1A2)                      # local normals
-# tangent_y = tangent_closest_to_axis(-local_nrm_out_y, axis=np.array([0,1,0]))
-
-# for i in range(len(tangent_y)):
-#     aux_rot_local = rotation_from_xz(-local_nrm_out_y[i], tangent_y[i])
-#     rot_local.append(aux_rot_local)
 
 
-# local_nrm_out = np.vstack([local_nrm_out_x])
+def save_grasp_poses(
+    filename,
+    positions,
+    rotations,
+    theta,
+    closing_positions_top,
+    closing_positions_bottom
+):
 
-# pts_full_local = np.vstack([pts_full_surface_local_x])
+    positions = np.asarray(positions)
+    rotations = np.asarray(rotations)
 
-pts_full_local = superellipsoid_tools.sample_superquadric_projected(
-    theta_ellipsoid_A1A2,
-    n_u=10,
-    n_v=10,
-    axes=('x', 'y', 'z')
-)
-local_nrm_out = superellipsoid_tools.superellipsoid_normals_local(pts_full_local, theta_ellipsoid_A1A2)                      # local normals
-tangent_lists = tangent_candidates_from_axes(-local_nrm_out)
+    N = len(positions)
 
-pts_expanded = []
-normals_expanded = []
-rot_local = []
+    data = {
+        "theta": list(np.asarray(theta)),
+        "num_grasps": int(N),
+        "grasps": []
+    }
 
-for i in range(len(pts_full_local)):
-    n = -local_nrm_out[i]
+    for i in range(N):
 
-    for t in tangent_lists[i]:
+        # use YOUR quaternion function
+        qx, qy, qz, qw = rotation_matrix_to_quaternion(rotations[i])
+
+        grasp = {
+            "position": {
+                "x": float(positions[i][0]),
+                "y": float(positions[i][1]),
+                "z": float(positions[i][2])
+            },
+            "orientation": {
+                "qx": float(qx),
+                "qy": float(qy),
+                "qz": float(qz),
+                "qw": float(qw)
+            },
+            "closing_position_top": float(closing_positions_top[i]),
+            "closing_position_bottom": float(closing_positions_bottom[i])
+        }
+
+        data["grasps"].append(grasp)
+
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=4)
+
+    print(f"Saved {N} grasp poses to {filename}")
+
+def save_contact_points(
+    filename,
+    top_contact_points,
+    bottom_contact_points
+):
+
+    data = {
+        "num_grasps": len(top_contact_points),
+        "contacts": []
+    }
+
+    for i in range(len(top_contact_points)):
+
+        entry = {
+            "top_contact_points": np.asarray(
+                top_contact_points[i]
+            ).tolist(),
+
+            "bottom_contact_points": np.asarray(
+                bottom_contact_points[i]
+            ).tolist()
+        }
+
+        data["contacts"].append(entry)
+
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=4)
+
+    print(f"Saved contact points to {filename}")
+
+def quaternion_to_rotation_matrix(qx, qy, qz, qw):
+    """
+    Convert quaternion (x, y, z, w) to a 3x3 rotation matrix.
+    """
+    q = np.array([qx, qy, qz, qw], dtype=float)
+    q = q / (np.linalg.norm(q) + 1e-12)
+
+    x, y, z, w = q
+
+    R = np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
+        [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
+        [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)]
+    ], dtype=float)
+
+    return R
+
+
+def rotation_angle_between(R1, R2):
+    """
+    Smallest rotation angle between two rotation matrices, in radians.
+    """
+    R_rel = R1.T @ R2
+    val = (np.trace(R_rel) - 1.0) / 2.0
+    val = np.clip(val, -1.0, 1.0)
+    return np.arccos(val)
+
+
+def load_grasp_poses_from_json(filename):
+    """
+    Load positions and rotations from your grasp JSON file.
+    Returns:
+        positions: (N,3)
+        rotations: (N,3,3)
+    """
+    with open(filename, "r") as f:
+        data = json.load(f)
+
+    grasps = data["grasps"]
+
+    positions = []
+    rotations = []
+
+    for g in grasps:
+        p = g["position"]
+        q = g["orientation"]
+
+        pos = np.array([p["x"], p["y"], p["z"]], dtype=float)
+        R = quaternion_to_rotation_matrix(
+            q["qx"], q["qy"], q["qz"], q["qw"]
+        )
+
+        positions.append(pos)
+        rotations.append(R)
+
+    return np.asarray(positions), np.asarray(rotations)
+
+
+def analyze_grasp_spacing(
+    positions,
+    rotations,
+    pos_thresh=0.01,
+    ang_thresh_deg=5.0,
+):
+    """
+    Analyze grasp spacing and near-duplicate poses.
+
+    A pair is considered a near-duplicate if:
+      - position distance < pos_thresh
+      - orientation angle < ang_thresh_deg
+
+    Also counts how many poses share exactly the same position
+    but have different orientation.
+
+    Returns a dictionary with:
+      - n_poses
+      - min_position_distance
+      - mean_nearest_position_distance
+      - num_pairs_below_pos_thresh
+      - num_near_duplicate_pairs
+      - num_poses_same_position_different_orientation
+      - nearest_neighbor_distances
+      - duplicate_pairs
+    """
+    positions = np.asarray(positions, dtype=float)
+    rotations = np.asarray(rotations, dtype=float)
+
+    N = len(positions)
+    if N < 2:
+        return {
+            "n_poses": N,
+            "min_position_distance": None,
+            "mean_nearest_position_distance": None,
+            "num_pairs_below_pos_thresh": 0,
+            "num_near_duplicate_pairs": 0,
+            "num_poses_same_position_different_orientation": 0,
+            "same_position_different_orientation_indices": [],
+            "nearest_neighbor_distances": np.array([]),
+            "duplicate_pairs": []
+        }
+
+    ang_thresh = np.deg2rad(ang_thresh_deg)
+    same_pos_angle_tol = np.deg2rad(ang_thresh_deg)
+
+    nearest_dists = np.full(N, np.inf, dtype=float)
+    min_dist = np.inf
+
+    num_pairs_below_pos_thresh = 0
+    duplicate_pairs = []
+
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.linalg.norm(positions[i] - positions[j])
+
+            if d < nearest_dists[i]:
+                nearest_dists[i] = d
+            if d < nearest_dists[j]:
+                nearest_dists[j] = d
+
+            if d < min_dist:
+                min_dist = d
+
+            if d < pos_thresh:
+                num_pairs_below_pos_thresh += 1
+
+                ang = rotation_angle_between(rotations[i], rotations[j])
+
+                if ang < ang_thresh:
+                    duplicate_pairs.append({
+                        "i": i,
+                        "j": j,
+                        "distance": float(d),
+                        "angle_deg": float(np.rad2deg(ang))
+                    })
+
+     # --- same position but different orientation ---
+    pos_groups = defaultdict(list)
+    for i, p in enumerate(positions):
+        pos_groups[tuple(p.tolist())].append(i)
+
+    same_position_different_orientation_indices = []
+
+    for idxs in pos_groups.values():
+        if len(idxs) < 2:
+            continue
+
+        different_found = False
+        for a in range(len(idxs)):
+            for b in range(a + 1, len(idxs)):
+                i = idxs[a]
+                j = idxs[b]
+
+                ang = rotation_angle_between(rotations[i], rotations[j])
+
+                if ang > same_pos_angle_tol:
+                    different_found = True
+                    break
+            if different_found:
+                break
+
+        if different_found:
+            same_position_different_orientation_indices.extend(idxs)
+
+    return {
+        "n_poses": N,
+        "min_position_distance": float(min_dist),
+        "mean_nearest_position_distance": float(np.mean(nearest_dists)),
+        "num_pairs_below_pos_thresh": int(num_pairs_below_pos_thresh),
+        "num_near_duplicate_pairs": len(duplicate_pairs),
+        "num_poses_same_position_different_orientation": len(same_position_different_orientation_indices),
+        "same_position_different_orientation_indices": same_position_different_orientation_indices,
+        "nearest_neighbor_distances": nearest_dists,
+        "duplicate_pairs": duplicate_pairs
+    }
+
+
+def analyze_grasp_file(
+    filename,
+    pos_thresh=0.01,
+    ang_thresh_deg=5.0,
+    print_duplicates=True,
+    max_duplicates_to_print=20,
+    print_same_pos_diff_ori=True,
+    max_same_pos_diff_ori_to_print=50
+):
+    """
+    Convenience wrapper for your JSON file.
+    """
+    positions, rotations = load_grasp_poses_from_json(filename)
+
+    result = analyze_grasp_spacing(
+        positions,
+        rotations,
+        pos_thresh=pos_thresh,
+        ang_thresh_deg=ang_thresh_deg
+    )
+
+    print(f"Number of poses: {result['n_poses']}")
+    print(f"Minimum position distance: {result['min_position_distance']:.6f} m")
+    print(f"Mean nearest-neighbor distance: {result['mean_nearest_position_distance']:.6f} m")
+    print(f"Pairs with distance < {pos_thresh:.4f} m: {result['num_pairs_below_pos_thresh']}")
+    print(f"Near-duplicate pairs (distance < {pos_thresh:.4f} m and angle < {ang_thresh_deg:.2f} deg): "
+          f"{result['num_near_duplicate_pairs']}")
+
+    print(f"Poses with same position but different orientation: "
+          f"{result['num_poses_same_position_different_orientation']}")
+
+    if print_duplicates and result["duplicate_pairs"]:
+        print("\nSome near-duplicate pairs:")
+        for k, pair in enumerate(result["duplicate_pairs"][:max_duplicates_to_print]):
+            print(
+                f"  pair ({pair['i']}, {pair['j']}): "
+                f"dist = {pair['distance']:.6f} m, "
+                f"angle = {pair['angle_deg']:.4f} deg"
+            )
+
+    if print_same_pos_diff_ori and result["same_position_different_orientation_indices"]:
+        idxs = result["same_position_different_orientation_indices"]
+        print("\nIndices of poses with same position but different orientation:")
+        print(idxs[:max_same_pos_diff_ori_to_print])
+
+        if len(idxs) > max_same_pos_diff_ori_to_print:
+            print(f"... ({len(idxs) - max_same_pos_diff_ori_to_print} more)")
+
+    return result
+
+
+def generate_grasp_poses_for_superquadric(
+    theta,
+    max_gripper_width=0.19,
+    jaw_top=0.06,
+    jaw_bottom=0.06,
+    jaw_length=0.1,
+    back_length=0.0,
+    wrist_length=0.06,
+    pad_width=0.03,
+    tol_contact=0.001,
+    tol_dot=-0.99,
+    n_u=30,
+    n_v=30,
+    n_rotations=4,
+    prune_pos_thresh=0.01,
+    prune_ang_thresh_deg=5.0,
+    prune_zero_tol=1e-5,
+    collision_samples_per_seg=15,
+    pregrasp_offset_factor=0.2,
+    pad_n_length=15,
+    pad_n_width=10,
+    intersection_samples=100,
+    refine_steps=5,
+    chunk_size=4500,
+    alignment_thresh=0.95,
+    pad_low_x=0.2,
+    pad_high_x=0.8,
+    pad_low_z=0.2,
+    pad_high_z=0.8,
+    visualize=False,
+    visualize_step=1000
+):
+    """
+    Generate feasible grasp poses for a superquadric.
+
+    Parameters
+    ----------
+    theta : list or array-like
+        SQ parameters [e1, e2, a1, a2, a3, ...].
+
+    visualize : bool
+        If True, shows an intermediate Mayavi visualization.
+
+    Returns
+    -------
+    result : dict
+        Dictionary with candidate poses, collision-free poses, and final valid grasps.
+    """
+
+    theta = np.asarray(theta, dtype=float)
+
+    # ------------------------------------------------------------
+    # 1. Build gripper geometry
+    # ------------------------------------------------------------
+    gripper_segs, top_pad_segs, bottom_pad_segs = gripper_lines_local_3d_independent(
+        jaw_top=jaw_top,
+        jaw_bottom=jaw_bottom,
+        jaw_length=jaw_length,
+        back_length=back_length,
+        wrist_length=wrist_length,
+        pad_width=pad_width
+    )
+
+    x_left = -back_length
+    x_right = jaw_length
+    y_top = jaw_top
+    y_bot = -jaw_bottom
+    z_left = -pad_width / 2.0
+    z_right = pad_width / 2.0
+
+    finger_segs = top_pad_segs + bottom_pad_segs
+
+    # ------------------------------------------------------------
+    # 2. Sample SQ surface and compute one tangent per normal
+    # ------------------------------------------------------------
+    pts_full_local = superellipsoid_tools.sample_superquadric_projected(
+        theta,
+        n_u=n_u,
+        n_v=n_v,
+        axes=('x', 'y', 'z')
+    )
+
+    local_nrm_out = superellipsoid_tools.superellipsoid_normals_local(
+        pts_full_local,
+        theta
+    )
+
+    tangent_lists = tangent_candidates_from_axes(-local_nrm_out)
+
+    pts_expanded = []
+    normals_expanded = []
+    rot_local = []
+
+    for i in range(len(pts_full_local)):
+        n = -local_nrm_out[i]
+        t = tangent_lists[i][0]   # only one tangent per point
         R = rotation_from_xz(n, t)
 
         pts_expanded.append(pts_full_local[i])
         normals_expanded.append(local_nrm_out[i])
         rot_local.append(R)
 
-pts_full_local = np.asarray(pts_expanded)
-local_nrm_out = np.asarray(normals_expanded)
-rot_local = np.asarray(rot_local)
+    pts_full_local = np.asarray(pts_expanded)
+    local_nrm_out = np.asarray(normals_expanded)
+    rot_local = np.asarray(rot_local)
 
-pts_all_local = pts_full_local.copy()
-# print(pts_full_local)
-################################### PRUNE OR NOT ############################################3
-# idx = prune_indices_voxel(pts_full_local, 0.008)
-# local_nrm_out = local_nrm_out[idx]
-# pts_full_local = pts_full_local[idx]
-# rot_local = np.stack(rot_local)   
-# rot_local = rot_local[idx]
-# rot_local = rot_local.tolist()
+    # ------------------------------------------------------------
+    # 3. Prune seed candidates
+    # ------------------------------------------------------------
+    approach_dirs = rot_local[:, 0]
 
-
-
-angles = np.linspace(0.0, np.pi/2.0, n_rotations, endpoint=False)
-
-rot_local_all = []
-pts_full_local_all = []
-local_nrm_out_all = []
-
-print("Number of grasp before adding rotation: ", len(pts_full_local))
-
-
-for i in range(len(pts_full_local)):
-
-    p = pts_full_local[i]
-    n = local_nrm_out[i]
-    base_R = rot_local[i]   # already computed from normal + tangent
-
-    for ang in angles:
-        R_spin = rotation_matrix_about_axis(-n, ang)
-        R_new = R_spin @ base_R
-
-        pts_full_local_all.append(p)
-        local_nrm_out_all.append(n)
-        rot_local_all.append(R_new)
-
-
-pts_full_local = np.asarray(pts_full_local_all)
-local_nrm_out = np.asarray(local_nrm_out_all)
-rot_local = np.asarray(rot_local_all)
-
-print("Number of grasp after adding rotation: ", len(pts_full_local))
-
-keep_idx = prune_grasp_poses_fast(
-    pts_full_local,
-    rot_local,
-    pos_res=0.002,
-    ang_res=0.1,
-    use_closing_axis=True
-)
-pts_full_local = pts_full_local[keep_idx]
-rot_local = rot_local[keep_idx]
-local_nrm_out = local_nrm_out[keep_idx]
-
-print("Number of grasp after prunning rotation: ", len(pts_full_local))
-# # First lets filter out poses that collide with the object.
-t_grasp_poses = []
-rot_grasp_poses = []
-for i in range(0, len(pts_full_local), 1):
-    if not fingers_collide_sq_local(finger_segs, rot_local[i], pts_full_local[i]+0.2*jaw_length*local_nrm_out[i], theta_ellipsoid_A1A2, 15):
-        
-
-
-        
-        t_grasp_poses.append(pts_full_local[i]+0.2*jaw_length*local_nrm_out[i])
-        rot_grasp_poses.append(rot_local[i])
-        
-
-origin = np.array([[0, 0, 0]])
-x_axis = np.array([[1, 0, 0]])
-y_axis = np.array([[0, 1, 0]])
-z_axis = np.array([[0, 0, 1]])
-
-fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-plot_functions.showSuperquadrics(theta_ellipsoid_A1A2)
-plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
-plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
-plot_functions.showPoints(pts_full_local, scale_factor=0.005, figure=fig)
-plot_functions.showPoints(np.array(t_grasp_poses), scale_factor=0.01, color=(0,0,1), figure=fig)
-for i in range(0, len(t_grasp_poses), 1000):
-    gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_grasp_poses[i])
-    draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
-mlab.show()
-
-pts_top_local, pts_bot_local, dist_x, x_vals, z_vals = sample_pad_pairs_local(
-    x_left=x_left,
-    x_right=x_right,
-    y_top=y_top,
-    y_bot=y_bot,
-    z_left=z_left,
-    z_right=z_right,
-    n_length=15,
-    n_width=10
-)
-
-t_new_grasp_poses = []
-rot_new_grasp_poses = []
-center_points = []
-top_contact_points_close_all_grasps = []
-bottom_contact_points_close_all_grasps = []
-closing_positions_top = []
-closing_positions_bottom = []
-# print("Number of grasp that do not collide: ", len(t_grasp_poses))
-
-R_all = np.asarray(rot_grasp_poses)
-t_all = np.asarray(t_grasp_poses)
-
-hits_all, t_hits_all, n_hits_all, dist_top_all, dist_bottom_all = \
-    batched_grasp_intersections_chunked(
-        pts_top_local=pts_top_local,
-        pts_bot_local=pts_bot_local,
-        R_all=R_all,
-        t_all=t_all,
-        theta=theta_ellipsoid_A1A2,
-        samples=100,
-        refine_steps=5,
-        chunk_size=4500
+    keep_idx = prune_candidates_prefer_axis_zero(
+        positions=pts_full_local,
+        approach_dirs=approach_dirs,
+        pos_thresh=prune_pos_thresh,
+        ang_thresh_deg=prune_ang_thresh_deg,
+        zero_tol=prune_zero_tol
     )
 
-t_new_grasp_poses = []
-rot_new_grasp_poses = []
-center_points = []
-top_contact_points_close_all_grasps = []
-bottom_contact_points_close_all_grasps = []
-closing_positions_top = []
-closing_positions_bottom = []
+    pts_full_local = pts_full_local[keep_idx]
+    local_nrm_out = local_nrm_out[keep_idx]
+    rot_local = rot_local[keep_idx]
 
-for i in range(1, len(t_grasp_poses)):
-    print("i:", i)
+    print("Number of grasp seeds after pruning:", len(pts_full_local))
 
-    hits = hits_all[i]              # (M,2,3)
-    t_hits = t_hits_all[i]          # (M,2)
-    n_hits = n_hits_all[i]          # (M,)
-    dist_top = dist_top_all[i]      # (M,)
-    dist_bottom = dist_bottom_all[i]# (M,)
+    # ------------------------------------------------------------
+    # 4. Add spin rotations around normal
+    # ------------------------------------------------------------
+    angles = np.linspace(0.0, np.pi, n_rotations, endpoint=False)
 
-    valid = (n_hits == 2)
+    rot_local_all = []
+    pts_full_local_all = []
+    local_nrm_out_all = []
 
-    if not np.any(valid):
-        continue
+    print("Number of grasp seeds before adding rotation:", len(pts_full_local))
 
-    dist_top_valid = dist_top[valid]
-    dist_bottom_valid = dist_bottom[valid]
-    hits_valid = hits[valid]
+    for i in range(len(pts_full_local)):
+        p = pts_full_local[i]
+        n = local_nrm_out[i]
+        base_R = rot_local[i]
 
-    idx_top = np.argmin(dist_top_valid)
-    idx_bottom = np.argmin(dist_bottom_valid)
+        for ang in angles:
+            R_spin = rotation_matrix_about_axis(-n, ang)
+            R_new = R_spin @ base_R
 
-    d_top_min_contact = dist_top_valid[idx_top]
-    d_bottom_min_contact = dist_bottom_valid[idx_bottom]
+            pts_full_local_all.append(p)
+            local_nrm_out_all.append(n)
+            rot_local_all.append(R_new)
 
-    pt_top_contact = hits_valid[idx_top, 0]
-    pt_bottom_contact = hits_valid[idx_bottom, 1]
+    pts_full_local = np.asarray(pts_full_local_all)
+    local_nrm_out = np.asarray(local_nrm_out_all)
+    rot_local = np.asarray(rot_local_all)
 
-    # keep_grasp = abs(d_top_min_contact - d_bottom_min_contact) <= 3*tol_contact
-    # # keep_grasp = True
-    # if not keep_grasp:
-    #     continue
+    print("Number of grasp seeds after adding rotation:", len(pts_full_local))
 
-    mask_top_close = np.abs(dist_top_valid - d_top_min_contact) <= tol_contact
-    mask_bottom_close = np.abs(dist_bottom_valid - d_bottom_min_contact) <= tol_contact
+    # ------------------------------------------------------------
+    # 5. Collision pre-filter
+    # ------------------------------------------------------------
+    t_grasp_poses = []
+    rot_grasp_poses = []
 
-    top_contact_points_close = hits_valid[mask_top_close, 0]
-    bottom_contact_points_close = hits_valid[mask_bottom_close, 1]
+    pregrasp_offset = pregrasp_offset_factor * jaw_length
 
-    centroid_top_sq = np.mean(top_contact_points_close, axis=0)
-    centroid_bottom_sq = np.mean(bottom_contact_points_close, axis=0)
+    for i in range(len(pts_full_local)):
+        t_pre = pts_full_local[i] + pregrasp_offset * local_nrm_out[i]
 
-    contact_pts_centroid = np.vstack([centroid_top_sq, centroid_bottom_sq])
-    normals_contact = superellipsoid_tools.superellipsoid_normals_local(
-        contact_pts_centroid,
-        theta_ellipsoid_A1A2
+        if not fingers_collide_sq_local(
+            finger_segs,
+            rot_local[i],
+            t_pre,
+            theta,
+            collision_samples_per_seg
+        ):
+            t_grasp_poses.append(t_pre)
+            rot_grasp_poses.append(rot_local[i])
+
+    print("Number of grasp poses after collision checking:", len(t_grasp_poses))
+
+    # ------------------------------------------------------------
+    # Optional visualization of collision-free poses
+    # ------------------------------------------------------------
+    if visualize:
+        origin = np.array([[0, 0, 0]])
+        x_axis = np.array([[1, 0, 0]])
+        y_axis = np.array([[0, 1, 0]])
+        z_axis = np.array([[0, 0, 1]])
+
+        fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+        plot_functions.showSuperquadrics(theta)
+        plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1,
+                                    color=(1, 0, 0), scale_factor=1.0, figure=fig)
+        plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1,
+                                    color=(0, 1, 0), scale_factor=1.0, figure=fig)
+        plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1,
+                                    color=(0, 0, 1), scale_factor=1.0, figure=fig)
+        plot_functions.showPoints(pts_full_local, scale_factor=0.005, figure=fig)
+
+        if len(t_grasp_poses) > 0:
+            plot_functions.showPoints(np.array(t_grasp_poses), scale_factor=0.01,
+                                      color=(0, 0, 1), figure=fig)
+
+            for i in range(0, len(t_grasp_poses), max(1, visualize_step)):
+                gripper_at_pose = transform_lines_3d(
+                    gripper_segs,
+                    rot_grasp_poses[i],
+                    t_grasp_poses[i]
+                )
+                draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
+
+        mlab.show()
+
+    # ------------------------------------------------------------
+    # 6. Sample pad points for contact evaluation
+    # ------------------------------------------------------------
+    pts_top_local, pts_bot_local, dist_x, x_vals, z_vals = sample_pad_pairs_local(
+        x_left=x_left,
+        x_right=x_right,
+        y_top=y_top,
+        y_bot=y_bot,
+        z_left=z_left,
+        z_right=z_right,
+        n_length=pad_n_length,
+        n_width=pad_n_width
     )
 
-    n_top = normals_contact[0]
-    n_bottom = normals_contact[1]
-    dot_val = np.dot(n_top, n_bottom)
-    ok_antipodal = dot_val <= tol_dot
-    if not ok_antipodal:
-        continue
-    center_point = 0.5 * (centroid_top_sq + centroid_bottom_sq)
-    
-    approach = rot_grasp_poses[i][:,0]   # gripper x axis
+    R_all = np.asarray(rot_grasp_poses)
+    t_all = np.asarray(t_grasp_poses)
 
-    v = center_point - t_grasp_poses[i]
+    # If there are no collision-free candidates, return early
+    if len(t_all) == 0:
+        return {
+            "theta": theta,
+            "seed_positions": pts_full_local,
+            "seed_rotations": rot_local,
+            "collision_free_positions": [],
+            "collision_free_rotations": [],
+            "final_positions": [],
+            "final_rotations": [],
+            "center_points": [],
+            "closing_positions_top": [],
+            "closing_positions_bottom": [],
+            "top_contact_points": [],
+            "bottom_contact_points": []
+        }
 
-    alignment = abs(np.dot(v, approach)) / (np.linalg.norm(v) + 1e-12)
-    
-    if alignment < 0.95:
-        continue
-    
-    closing_position_top = jaw_top - d_top_min_contact
-    closing_position_bottom = jaw_bottom - d_bottom_min_contact
-
-    centroid_contact_top_gripper = points_sq_to_gripper_local(
-        centroid_top_sq[None, :],
-        rot_grasp_poses[i],
-        t_grasp_poses[i]
-    )
-
-    ok_top_centered, centroid_top, ux_top, uz_top = \
-        centroid_in_pad_central_region_gripper(
-            centroid_contact_top_gripper,
-            x_left, x_right, z_left, z_right,
-            low_x=0.2, low_z=0.2, high_x=0.8, high_z=0.8
+    # ------------------------------------------------------------
+    # 7. Batched SQ intersections
+    # ------------------------------------------------------------
+    hits_all, t_hits_all, n_hits_all, dist_top_all, dist_bottom_all = \
+        batched_grasp_intersections_chunked(
+            pts_top_local=pts_top_local,
+            pts_bot_local=pts_bot_local,
+            R_all=R_all,
+            t_all=t_all,
+            theta=theta,
+            samples=intersection_samples,
+            refine_steps=refine_steps,
+            chunk_size=chunk_size
         )
 
-    if not ok_top_centered:
-        continue
+    # ------------------------------------------------------------
+    # 8. Final grasp validation
+    # ------------------------------------------------------------
+    t_new_grasp_poses = []
+    rot_new_grasp_poses = []
+    center_points = []
+    top_contact_points_close_all_grasps = []
+    bottom_contact_points_close_all_grasps = []
+    closing_positions_top = []
+    closing_positions_bottom = []
 
-    top_contact_points_close_all_grasps.append(top_contact_points_close)
-    bottom_contact_points_close_all_grasps.append(bottom_contact_points_close)
+    for i in range(len(t_grasp_poses)):
+        hits = hits_all[i]
+        n_hits = n_hits_all[i]
+        dist_top = dist_top_all[i]
+        dist_bottom = dist_bottom_all[i]
 
-    closing_positions_bottom.append(closing_position_bottom)
-    closing_positions_top.append(closing_position_top)
+        valid = (n_hits == 2)
+        if not np.any(valid):
+            continue
 
-    t_new = t_grasp_poses[i]
-    R_new = rot_grasp_poses[i]
-    center_point = 0.5 * (pt_top_contact + pt_bottom_contact)
+        dist_top_valid = dist_top[valid]
+        dist_bottom_valid = dist_bottom[valid]
+        hits_valid = hits[valid]
 
-    t_new_grasp_poses.append(t_new)
-    rot_new_grasp_poses.append(R_new)
-    center_points.append(center_point)
+        idx_top = np.argmin(dist_top_valid)
+        idx_bottom = np.argmin(dist_bottom_valid)
+
+        d_top_min_contact = dist_top_valid[idx_top]
+        d_bottom_min_contact = dist_bottom_valid[idx_bottom]
+
+        mask_top_close = np.abs(dist_top_valid - d_top_min_contact) <= tol_contact
+        mask_bottom_close = np.abs(dist_bottom_valid - d_bottom_min_contact) <= tol_contact
+
+        top_contact_points_close = hits_valid[mask_top_close, 0]
+        bottom_contact_points_close = hits_valid[mask_bottom_close, 1]
+
+        centroid_top_sq = np.mean(top_contact_points_close, axis=0)
+        centroid_bottom_sq = np.mean(bottom_contact_points_close, axis=0)
+
+        contact_pts_centroid = np.vstack([centroid_top_sq, centroid_bottom_sq])
+
+        normals_contact = superellipsoid_tools.superellipsoid_normals_local(
+            contact_pts_centroid,
+            theta
+        )
+
+        n_top = normals_contact[0]
+        n_bottom = normals_contact[1]
+        dot_val = np.dot(n_top, n_bottom)
+
+        ok_antipodal = dot_val <= tol_dot
+        if not ok_antipodal:
+            continue
+
+        center_point = 0.5 * (centroid_top_sq + centroid_bottom_sq)
+
+        approach = rot_grasp_poses[i][:, 0]
+        v = center_point - t_grasp_poses[i]
+        alignment = abs(np.dot(v, approach)) / (np.linalg.norm(v) + 1e-12)
+
+        if alignment < alignment_thresh:
+            continue
+
+        closing_position_top = jaw_top - d_top_min_contact
+        closing_position_bottom = jaw_bottom - d_bottom_min_contact
+
+        centroid_contact_top_gripper = points_sq_to_gripper_local(
+            centroid_top_sq[None, :],
+            rot_grasp_poses[i],
+            t_grasp_poses[i]
+        )
+
+        ok_top_centered, _, ux_top, uz_top = centroid_in_pad_central_region_gripper(
+            centroid_contact_top_gripper,
+            x_left, x_right, z_left, z_right,
+            low_x=pad_low_x, low_z=pad_low_z,
+            high_x=pad_high_x, high_z=pad_high_z
+        )
+
+        centroid_contact_bottom_gripper = points_sq_to_gripper_local(
+            centroid_bottom_sq[None, :],
+            rot_grasp_poses[i],
+            t_grasp_poses[i]
+        )
+
+        ok_bottom_centered, _, ux_bottom, uz_bottom = centroid_in_pad_central_region_gripper(
+            centroid_contact_bottom_gripper,
+            x_left, x_right, z_left, z_right,
+            low_x=pad_low_x, low_z=pad_low_z,
+            high_x=pad_high_x, high_z=pad_high_z
+        )
+
+        if not (ok_top_centered and ok_bottom_centered):
+            continue
+
+        t_new_grasp_poses.append(t_grasp_poses[i])
+        rot_new_grasp_poses.append(rot_grasp_poses[i])
+        center_points.append(center_point)
+
+        top_contact_points_close_all_grasps.append(top_contact_points_close)
+        bottom_contact_points_close_all_grasps.append(bottom_contact_points_close)
+
+        closing_positions_top.append(closing_position_top)
+        closing_positions_bottom.append(closing_position_bottom)
+
+    print("Number of final valid grasps:", len(t_new_grasp_poses))
+
+    # ------------------------------------------------------------
+    # 9. Return everything useful
+    # ------------------------------------------------------------
+    return {
+        "theta": theta,
+        "seed_positions": pts_full_local,
+        "seed_rotations": rot_local,
+        "collision_free_positions": t_grasp_poses,
+        "collision_free_rotations": rot_grasp_poses,
+        "final_positions": t_new_grasp_poses,
+        "final_rotations": rot_new_grasp_poses,
+        "center_points": center_points,
+        "closing_positions_top": closing_positions_top,
+        "closing_positions_bottom": closing_positions_bottom,
+        "top_contact_points": top_contact_points_close_all_grasps,
+        "bottom_contact_points": bottom_contact_points_close_all_grasps
+    }
+MAX_GRIPPER_WIDTH = 0.19
+jaw_top = 0.06
+jaw_bottom = 0.06
+jaw_length = 0.1
+back_length = 0.0
+wrist_length = 0.06
+theta_cylinder = [0.2, 1.0, 0.05, 0.05, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+pad_width = 0.03
+tol_contact = 0.001   # example: 2 mm
+tol_dot = -0.99       # antipodal threshold
+pos_thresh=0.01
+ang_thresh_deg=5.0
+zero_tol=1e-5
+pad_n_length = 15
+pad_n_width = 10
+intersection_samples = 100
+refine_steps = 5
+chunk_size = 4500
+alignment_thresh = 0.95
+pad_low_x = 0.2
+pad_low_z = 0.2
+pad_high_x = 0.8
+pad_high_z = 0.8
+result = generate_grasp_poses_for_superquadric(
+    theta=theta_cylinder,
+    n_u=30,
+    n_v=30,
+    n_rotations=6,
+    visualize=True,
+    max_gripper_width=MAX_GRIPPER_WIDTH,
+    jaw_top=jaw_top, jaw_bottom=jaw_bottom, jaw_length=jaw_length,
+    back_length=back_length, wrist_length=wrist_length,
+    pad_width=pad_width, tol_contact=tol_contact, tol_dot=tol_dot,
+    prune_pos_thresh=pos_thresh, prune_ang_thresh_deg=ang_thresh_deg,
+    prune_zero_tol=zero_tol, pad_n_length= pad_n_length, pad_n_width=pad_n_width,
+    intersection_samples=intersection_samples, refine_steps=refine_steps,
+    chunk_size=chunk_size, alignment_thresh=alignment_thresh, pad_low_x=pad_low_x,
+    pad_low_z=pad_low_z, pad_high_x=pad_high_x, pad_high_z=pad_high_z
+    
+)
+
+t_grasps = result["final_positions"]
+R_grasps = result["final_rotations"]
+closing_positions_top=result["closing_positions_top"]
+closing_positions_bottom=result["closing_positions_bottom"]
+top_contact_points = result["top_contact_points"]
+bottom_contact_points = result["bottom_contact_points"]
+
+save_grasp_poses(
+    "grasp_poses.json",
+    t_grasps,
+    R_grasps,
+    theta=theta_cylinder,
+    closing_positions_top=closing_positions_top,
+    closing_positions_bottom=closing_positions_bottom,
+)
+
+save_contact_points(
+    "contact_points.json",
+    top_contact_points,
+    bottom_contact_points
+)
+
+result = analyze_grasp_file(
+    "grasp_poses.json",
+    pos_thresh=pos_thresh,
+    ang_thresh_deg=ang_thresh_deg
+)
+
+result = analyze_grasp_file("grasp_poses.json")
+idxs = result["same_position_different_orientation_indices"]
 
 
-print("computed")
-
-
-# for i in range(0, len(t_new_grasp_poses), 4):
-#     fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-#     plot_functions.showSuperquadrics(theta_ellipsoid_A1A2)
-#     # plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
-#     # plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
-#     # plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
-#     plot_functions.showPoints(pts_full_local, scale_factor=0.005, figure=fig)
-#     plot_functions.showPoints(np.array(t_new_grasp_poses), color=(0,1,0), scale_factor=0.008, figure=fig)
-#     gripper_segs_contact, _, _ = gripper_lines_local_3d_independent(
-#     jaw_top=closing_positions_top[i],      # top finger opened more
-#     jaw_bottom=closing_positions_bottom[i],   # bottom finger opened less
-#     jaw_length=jaw_length,
-#     back_length=back_length,
-#     wrist_length=wrist_length,
-#     pad_width=pad_width
-#     )
-#     gripper_at_pose = transform_lines_3d(gripper_segs_contact, rot_new_grasp_poses[i], t_new_grasp_poses[i])
-#     draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
-#     plot_functions.showPoints(np.array(top_contact_points_close_all_grasps[i]), color=(0,0,1), scale_factor=0.008, figure=fig)
-#     plot_functions.showPoints(np.array(bottom_contact_points_close_all_grasps[i]), color=(0,0,1), scale_factor=0.008, figure=fig)
-
-#     mlab.show()
 print("Figure")
 fig = mlab.figure(size=(400, 400), bgcolor=(1,1,1))
 MAX_CONTACT_POINTS = 100
 contact_top_array = np.full((MAX_CONTACT_POINTS, 3), np.nan)
 contact_bottom_array = np.full((MAX_CONTACT_POINTS, 3), np.nan)
-plot_functions.showSuperquadrics(theta_ellipsoid_A1A2)
+plot_functions.showSuperquadrics(theta_cylinder)
 
 # initial gripper
 i = 0
@@ -1616,7 +2255,7 @@ gripper_segs_contact, _, _ = gripper_lines_local_3d_independent(
     wrist_length=wrist_length,
     pad_width=pad_width
 )
-gripper_at_pose = transform_lines_3d(gripper_segs_contact, rot_new_grasp_poses[i], t_new_grasp_poses[i])
+gripper_at_pose = transform_lines_3d(gripper_segs_contact, R_grasps[i], t_grasps[i])
 gripper_plot = draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
 
 contact_top = mlab.points3d(
@@ -1656,7 +2295,7 @@ def update_contacts(actor, pts, max_pts):
     )
 @mlab.animate(delay=100)
 def anim():
-    for i in range(0,len(t_new_grasp_poses), 1):
+    for idx in range(0,len(t_grasps), 1):
 
         gripper_segs_contact, _, _ = gripper_lines_local_3d_independent(
             jaw_top=closing_positions_top[i],
@@ -1669,47 +2308,419 @@ def anim():
 
         gripper_at_pose = transform_lines_3d(
             gripper_segs_contact,
-            rot_new_grasp_poses[i],
-            t_new_grasp_poses[i]
+            R_grasps[idx],
+            t_grasps[idx]
         )
 
         # update gripper
         update_segments_mlab(gripper_plot, gripper_at_pose)
 
-        # # update contact points
-        # contact_top.mlab_source.set(
-        #     x=top_contact_points_close_all_grasps[i][:,0],
-        #     y=top_contact_points_close_all_grasps[i][:,1],
-        #     z=top_contact_points_close_all_grasps[i][:,2]
-        # )
-
-        # contact_bottom.mlab_source.set(
-        #     x=bottom_contact_points_close_all_grasps[i][:,0],
-        #     y=bottom_contact_points_close_all_grasps[i][:,1],
-        #     z=bottom_contact_points_close_all_grasps[i][:,2]
-        # )
-
         update_contacts(contact_top,
-                top_contact_points_close_all_grasps[i],
+                top_contact_points[idx],
                 MAX_CONTACT_POINTS)
 
         update_contacts(contact_bottom,
-                        bottom_contact_points_close_all_grasps[i],
+                        bottom_contact_points[idx],
                         MAX_CONTACT_POINTS)
         yield
 
 anim()
 mlab.show()
-# theta = [0.4, 0.1, 0.07, 0.07, 0.3, 0, 0, 0, 0, 0, 0]
 
-# p0 = np.array([-0.2, 0.0, 0.0])
-# p1 = np.array([ 0.2, 0.0, 0.0])
+#theta_ellipsoid_A1A2 = [0.1, 0.1, 0.04, 0.15, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# theta_ellipsoid_A1A2 = [0.2, 1.0, 0.05, 0.05, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# n_rotations = 4
+# gripper_segs, top_pad_segs, bottom_pad_segs = gripper_lines_local_3d_independent(
+#     jaw_top=jaw_top,      # top finger opened more
+#     jaw_bottom=jaw_bottom,   # bottom finger opened less
+#     jaw_length=jaw_length,
+#     back_length=back_length,
+#     wrist_length=wrist_length,
+#     pad_width=pad_width
+# )
 
-# hits, t_hits = intersect_segment_superquadric_all(p0, p1, theta)
+# x_left = -back_length
+# x_right = jaw_length
+# y_top = jaw_top
+# y_bot = -jaw_bottom
+# z_left = -pad_width / 2
+# z_right = pad_width / 2
 
-# print("t_hits:", t_hits)
-# print("hits:\n", hits)
 
-# local_nrm_out_hits = superellipsoid_normals_local(hits, theta)                      # local normals
 
-# print("normals: ", local_nrm_out_hits)
+# finger_segs = top_pad_segs + bottom_pad_segs
+# rot_local = []
+
+# pts_full_local = superellipsoid_tools.sample_superquadric_projected(
+#     theta_ellipsoid_A1A2,
+#     n_u=30,
+#     n_v=30,
+#     axes=('x', 'y', 'z')
+# )
+# local_nrm_out = superellipsoid_tools.superellipsoid_normals_local(pts_full_local, theta_ellipsoid_A1A2)                      # local normals
+# tangent_lists = tangent_candidates_from_axes(-local_nrm_out)
+
+# pts_expanded = []
+# normals_expanded = []
+# rot_local = []
+
+
+
+# for i in range(len(pts_full_local)):
+#     n = -local_nrm_out[i]
+#     t = tangent_lists[i][0]
+#     R = rotation_from_xz(n, t)
+
+#     pts_expanded.append(pts_full_local[i])
+#     normals_expanded.append(local_nrm_out[i])
+#     rot_local.append(R)
+
+# pts_full_local = np.asarray(pts_expanded)
+# local_nrm_out = np.asarray(normals_expanded)
+# rot_local = np.asarray(rot_local)
+
+# pts_all_local = pts_full_local.copy()
+
+
+# approach_dirs = rot_local[:, 0]
+# keep_idx = prune_candidates_prefer_axis_zero(
+#     positions=pts_full_local,
+#     approach_dirs=approach_dirs,
+#     pos_thresh=0.01,
+#     ang_thresh_deg=5.0,
+#     zero_tol=1e-5
+# )
+
+# pts_full_local = pts_full_local[keep_idx]
+# local_nrm_out = local_nrm_out[keep_idx]
+# rot_local = rot_local[keep_idx]
+
+
+# print("Number of grasp after prunning: ", len(pts_full_local))
+
+# angles = np.linspace(0.0, np.pi, n_rotations, endpoint=False)
+
+# rot_local_all = []
+# pts_full_local_all = []
+# local_nrm_out_all = []
+
+# print("Number of grasp before adding rotation: ", len(pts_full_local))
+
+
+# for i in range(len(pts_full_local)):
+
+#     p = pts_full_local[i]
+#     n = local_nrm_out[i]
+#     base_R = rot_local[i]   # already computed from normal + tangent
+
+#     for ang in angles:
+#         R_spin = rotation_matrix_about_axis(-n, ang)
+#         R_new = R_spin @ base_R
+
+#         pts_full_local_all.append(p)
+#         local_nrm_out_all.append(n)
+#         rot_local_all.append(R_new)
+
+
+# pts_full_local = np.asarray(pts_full_local_all)
+# local_nrm_out = np.asarray(local_nrm_out_all)
+# rot_local = np.asarray(rot_local_all)
+
+# print("Number of grasp after adding rotation: ", len(pts_full_local))
+
+
+# # # First lets filter out poses that collide with the object.
+# t_grasp_poses = []
+# rot_grasp_poses = []
+# for i in range(0, len(pts_full_local), 1):
+#     if not fingers_collide_sq_local(finger_segs, rot_local[i], pts_full_local[i]+0.2*jaw_length*local_nrm_out[i], theta_ellipsoid_A1A2, 15):
+        
+
+
+        
+#         t_grasp_poses.append(pts_full_local[i]+0.2*jaw_length*local_nrm_out[i])
+#         rot_grasp_poses.append(rot_local[i])
+        
+# print("Number of grasp poses after collision checking: ", len(t_grasp_poses))
+
+# origin = np.array([[0, 0, 0]])
+# x_axis = np.array([[1, 0, 0]])
+# y_axis = np.array([[0, 1, 0]])
+# z_axis = np.array([[0, 0, 1]])
+
+# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# plot_functions.showSuperquadrics(theta_ellipsoid_A1A2)
+# plot_functions.show_vectors(origin, x_axis, mode='arrow', every=1, color=(1,0,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, y_axis, mode='arrow', every=1, color=(0,1,0), scale_factor=1.0, figure=fig)
+# plot_functions.show_vectors(origin, z_axis, mode='arrow', every=1, color=(0,0,1), scale_factor=1.0, figure=fig)
+# plot_functions.showPoints(pts_full_local, scale_factor=0.005, figure=fig)
+# plot_functions.showPoints(np.array(t_grasp_poses), scale_factor=0.01, color=(0,0,1), figure=fig)
+# for i in range(0, len(t_grasp_poses), 1000):
+#     gripper_at_pose = transform_lines_3d(gripper_segs, rot_grasp_poses[i], t_grasp_poses[i])
+#     draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
+# mlab.show()
+
+# pts_top_local, pts_bot_local, dist_x, x_vals, z_vals = sample_pad_pairs_local(
+#     x_left=x_left,
+#     x_right=x_right,
+#     y_top=y_top,
+#     y_bot=y_bot,
+#     z_left=z_left,
+#     z_right=z_right,
+#     n_length=15,
+#     n_width=10
+# )
+
+# t_new_grasp_poses = []
+# rot_new_grasp_poses = []
+# center_points = []
+# top_contact_points_close_all_grasps = []
+# bottom_contact_points_close_all_grasps = []
+# closing_positions_top = []
+# closing_positions_bottom = []
+# # print("Number of grasp that do not collide: ", len(t_grasp_poses))
+
+# R_all = np.asarray(rot_grasp_poses)
+# t_all = np.asarray(t_grasp_poses)
+
+# hits_all, t_hits_all, n_hits_all, dist_top_all, dist_bottom_all = \
+#     batched_grasp_intersections_chunked(
+#         pts_top_local=pts_top_local,
+#         pts_bot_local=pts_bot_local,
+#         R_all=R_all,
+#         t_all=t_all,
+#         theta=theta_ellipsoid_A1A2,
+#         samples=100,
+#         refine_steps=5,
+#         chunk_size=4500
+#     )
+
+# t_new_grasp_poses = []
+# rot_new_grasp_poses = []
+# center_points = []
+# top_contact_points_close_all_grasps = []
+# bottom_contact_points_close_all_grasps = []
+# closing_positions_top = []
+# closing_positions_bottom = []
+
+# for i in range(1, len(t_grasp_poses)):
+#     print("i:", i)
+
+#     hits = hits_all[i]              # (M,2,3)
+#     t_hits = t_hits_all[i]          # (M,2)
+#     n_hits = n_hits_all[i]          # (M,)
+#     dist_top = dist_top_all[i]      # (M,)
+#     dist_bottom = dist_bottom_all[i]# (M,)
+
+#     valid = (n_hits == 2)
+
+#     if not np.any(valid):
+#         continue
+
+#     dist_top_valid = dist_top[valid]
+#     dist_bottom_valid = dist_bottom[valid]
+#     hits_valid = hits[valid]
+
+#     idx_top = np.argmin(dist_top_valid)
+#     idx_bottom = np.argmin(dist_bottom_valid)
+
+#     d_top_min_contact = dist_top_valid[idx_top]
+#     d_bottom_min_contact = dist_bottom_valid[idx_bottom]
+
+#     pt_top_contact = hits_valid[idx_top, 0]
+#     pt_bottom_contact = hits_valid[idx_bottom, 1]
+
+#     # keep_grasp = abs(d_top_min_contact - d_bottom_min_contact) <= 3*tol_contact
+#     # # keep_grasp = True
+#     # if not keep_grasp:
+#     #     continue
+
+#     mask_top_close = np.abs(dist_top_valid - d_top_min_contact) <= tol_contact
+#     mask_bottom_close = np.abs(dist_bottom_valid - d_bottom_min_contact) <= tol_contact
+
+#     top_contact_points_close = hits_valid[mask_top_close, 0]
+#     bottom_contact_points_close = hits_valid[mask_bottom_close, 1]
+
+#     centroid_top_sq = np.mean(top_contact_points_close, axis=0)
+#     centroid_bottom_sq = np.mean(bottom_contact_points_close, axis=0)
+
+#     contact_pts_centroid = np.vstack([centroid_top_sq, centroid_bottom_sq])
+#     normals_contact = superellipsoid_tools.superellipsoid_normals_local(
+#         contact_pts_centroid,
+#         theta_ellipsoid_A1A2
+#     )
+
+#     n_top = normals_contact[0]
+#     n_bottom = normals_contact[1]
+#     dot_val = np.dot(n_top, n_bottom)
+#     ok_antipodal = dot_val <= tol_dot
+#     if not ok_antipodal:
+#         continue
+#     center_point = 0.5 * (centroid_top_sq + centroid_bottom_sq)
+    
+#     approach = rot_grasp_poses[i][:,0]   # gripper x axis
+
+#     v = center_point - t_grasp_poses[i]
+
+#     alignment = abs(np.dot(v, approach)) / (np.linalg.norm(v) + 1e-12)
+    
+#     if alignment < 0.95:
+#         continue
+    
+#     closing_position_top = jaw_top - d_top_min_contact
+#     closing_position_bottom = jaw_bottom - d_bottom_min_contact
+
+#     centroid_contact_top_gripper = points_sq_to_gripper_local(
+#         centroid_top_sq[None, :],
+#         rot_grasp_poses[i],
+#         t_grasp_poses[i]
+#     )
+
+#     ok_top_centered, centroid_top, ux_top, uz_top = \
+#         centroid_in_pad_central_region_gripper(
+#             centroid_contact_top_gripper,
+#             x_left, x_right, z_left, z_right,
+#             low_x=0.2, low_z=0.2, high_x=0.8, high_z=0.8
+#         )
+        
+#     centroid_contact_bottom_gripper = points_sq_to_gripper_local(
+#     centroid_bottom_sq[None, :],
+#     rot_grasp_poses[i],
+#     t_grasp_poses[i]
+#     )
+
+#     ok_bottom_centered, _, ux_bottom, uz_bottom = centroid_in_pad_central_region_gripper(
+#         centroid_contact_bottom_gripper,
+#         x_left, x_right, z_left, z_right,
+#         low_x=0.2, low_z=0.2, high_x=0.8, high_z=0.8
+#     )
+
+#     if not (ok_top_centered and ok_bottom_centered):
+#         continue
+
+
+#     top_contact_points_close_all_grasps.append(top_contact_points_close)
+#     bottom_contact_points_close_all_grasps.append(bottom_contact_points_close)
+
+#     closing_positions_bottom.append(closing_position_bottom)
+#     closing_positions_top.append(closing_position_top)
+
+#     t_new = t_grasp_poses[i]
+#     R_new = rot_grasp_poses[i]
+#     center_point = 0.5 * (pt_top_contact + pt_bottom_contact)
+
+#     t_new_grasp_poses.append(t_new)
+#     rot_new_grasp_poses.append(R_new)
+#     center_points.append(center_point)
+
+
+# print("computed")
+
+# print("n_grasp_poses: ", len(t_new_grasp_poses))
+
+
+# save_grasp_poses(
+#     "grasp_poses.json",
+#     t_grasps,
+#     R_grasps
+# )
+
+# result = analyze_grasp_file(
+#     "grasp_poses.json",
+#     pos_thresh=0.01,
+#     ang_thresh_deg=5.0
+# )
+
+# result = analyze_grasp_file("grasp_poses.json")
+# idxs = result["same_position_different_orientation_indices"]
+
+
+# print("Figure")
+# fig = mlab.figure(size=(400, 400), bgcolor=(1,1,1))
+# MAX_CONTACT_POINTS = 100
+# contact_top_array = np.full((MAX_CONTACT_POINTS, 3), np.nan)
+# contact_bottom_array = np.full((MAX_CONTACT_POINTS, 3), np.nan)
+# plot_functions.showSuperquadrics(theta_cylinder)
+
+# # initial gripper
+# i = 0
+# gripper_segs_contact, _, _ = gripper_lines_local_3d_independent(
+#     jaw_top=closing_positions_top[i],
+#     jaw_bottom=closing_positions_bottom[i],
+#     jaw_length=jaw_length,
+#     back_length=back_length,
+#     wrist_length=wrist_length,
+#     pad_width=pad_width
+# )
+# gripper_at_pose = transform_lines_3d(gripper_segs_contact, rot_new_grasp_poses[i], t_new_grasp_poses[i])
+# gripper_plot = draw_segments_mlab(gripper_at_pose, tube_radius=0.003, figure=fig)
+
+# contact_top = mlab.points3d(
+#     contact_top_array[:,0],
+#     contact_top_array[:,1],
+#     contact_top_array[:,2],
+#     scale_factor=0.008,
+#     color=(0,0,1),
+#     figure=fig
+# )
+
+# contact_bottom = mlab.points3d(
+#     contact_bottom_array[:,0],
+#     contact_bottom_array[:,1],
+#     contact_bottom_array[:,2],
+#     scale_factor=0.008,
+#     color=(0,0,1),
+#     figure=fig
+# )
+# def update_contacts(actor, pts, max_pts):
+
+#     arr = np.full((max_pts,3), np.nan)
+
+#     pts = np.asarray(pts)
+
+#     if pts.ndim == 1:
+#         pts = pts.reshape(1,3)
+
+#     n = min(len(pts), max_pts)
+
+#     arr[:n] = pts[:n]
+
+#     actor.mlab_source.set(
+#         x=arr[:,0],
+#         y=arr[:,1],
+#         z=arr[:,2]
+#     )
+# @mlab.animate(delay=100)
+# def anim():
+#     for idx in range(0,len(t_new_grasp_poses), 1):
+
+#         gripper_segs_contact, _, _ = gripper_lines_local_3d_independent(
+#             jaw_top=closing_positions_top[i],
+#             jaw_bottom=closing_positions_bottom[i],
+#             jaw_length=jaw_length,
+#             back_length=back_length,
+#             wrist_length=wrist_length,
+#             pad_width=pad_width
+#         )
+
+#         gripper_at_pose = transform_lines_3d(
+#             gripper_segs_contact,
+#             rot_new_grasp_poses[idx],
+#             t_new_grasp_poses[idx]
+#         )
+
+#         # update gripper
+#         update_segments_mlab(gripper_plot, gripper_at_pose)
+
+#         update_contacts(contact_top,
+#                 top_contact_points_close_all_grasps[idx],
+#                 MAX_CONTACT_POINTS)
+
+#         update_contacts(contact_bottom,
+#                         bottom_contact_points_close_all_grasps[idx],
+#                         MAX_CONTACT_POINTS)
+#         yield
+
+# anim()
+# mlab.show()
+
