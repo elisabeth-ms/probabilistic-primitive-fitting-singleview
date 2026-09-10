@@ -793,40 +793,50 @@ def remove_largest_plane(points_np, distance_threshold=0.01, ransac_n=3, num_ite
     return remaining_points, plane_points, plane_model
 
 
-def build_rotation_matrix(euler_angles):
-    rz, ry, rx = euler_angles
+# def build_rotation_matrix(euler_angles):
+#     rz, ry, rx = euler_angles
 
-    cosx = torch.cos(rx)
-    sinx = torch.sin(rx)
-    cosy = torch.cos(ry)
-    siny = torch.sin(ry)
-    cosz = torch.cos(rz)
-    sinz = torch.sin(rz)
+#     cosx = torch.cos(rx)
+#     sinx = torch.sin(rx)
+#     cosy = torch.cos(ry)
+#     siny = torch.sin(ry)
+#     cosz = torch.cos(rz)
+#     sinz = torch.sin(rz)
 
-    # Rotation around x-axis
-    Rx = torch.stack([
-        torch.stack([torch.tensor(1., device=euler_angles.device), torch.tensor(0., device=euler_angles.device), torch.tensor(0., device=euler_angles.device)]),
-        torch.stack([torch.tensor(0., device=euler_angles.device), cosx, -sinx]),
-        torch.stack([torch.tensor(0., device=euler_angles.device), sinx,  cosx])
-    ])
+#     # Rotation around x-axis
+#     Rx = torch.stack([
+#         torch.stack([torch.tensor(1., device=euler_angles.device), torch.tensor(0., device=euler_angles.device), torch.tensor(0., device=euler_angles.device)]),
+#         torch.stack([torch.tensor(0., device=euler_angles.device), cosx, -sinx]),
+#         torch.stack([torch.tensor(0., device=euler_angles.device), sinx,  cosx])
+#     ])
 
-    # Rotation around y-axis
-    Ry = torch.stack([
-        torch.stack([cosy, torch.tensor(0., device=euler_angles.device), siny]),
-        torch.stack([torch.tensor(0., device=euler_angles.device), torch.tensor(1., device=euler_angles.device), torch.tensor(0., device=euler_angles.device)]),
-        torch.stack([-siny, torch.tensor(0., device=euler_angles.device), cosy])
-    ])
+#     # Rotation around y-axis
+#     Ry = torch.stack([
+#         torch.stack([cosy, torch.tensor(0., device=euler_angles.device), siny]),
+#         torch.stack([torch.tensor(0., device=euler_angles.device), torch.tensor(1., device=euler_angles.device), torch.tensor(0., device=euler_angles.device)]),
+#         torch.stack([-siny, torch.tensor(0., device=euler_angles.device), cosy])
+#     ])
 
-    # Rotation around z-axis
-    Rz = torch.stack([
-        torch.stack([cosz, -sinz, torch.tensor(0., device=euler_angles.device)]),
-        torch.stack([sinz,  cosz, torch.tensor(0., device=euler_angles.device)]),
-        torch.stack([torch.tensor(0., device=euler_angles.device), torch.tensor(0., device=euler_angles.device), torch.tensor(1., device=euler_angles.device)])
-    ])
+#     # Rotation around z-axis
+#     Rz = torch.stack([
+#         torch.stack([cosz, -sinz, torch.tensor(0., device=euler_angles.device)]),
+#         torch.stack([sinz,  cosz, torch.tensor(0., device=euler_angles.device)]),
+#         torch.stack([torch.tensor(0., device=euler_angles.device), torch.tensor(0., device=euler_angles.device), torch.tensor(1., device=euler_angles.device)])
+#     ])
 
-    R = Rz @ Ry @ Rx
+#     R = Rz @ Ry @ Rx
+#     return R
+def build_rotation_matrix(euler):
+    rz, ry, rx = euler
+    cz, sz = torch.cos(rz), torch.sin(rz)
+    cy, sy = torch.cos(ry), torch.sin(ry)
+    cx, sx = torch.cos(rx), torch.sin(rx)
+    # Rz @ Ry @ Rx
+    R = torch.empty(3,3, device=euler.device, dtype=euler.dtype)
+    R[0,0] = cz*cy;            R[0,1] = cz*sy*sx - sz*cx;  R[0,2] = cz*sy*cx + sz*sx
+    R[1,0] = sz*cy;            R[1,1] = sz*sy*sx + cz*cx;  R[1,2] = sz*sy*cx - cz*sx
+    R[2,0] = -sy;              R[2,1] = cy*sx;             R[2,2] = cy*cx
     return R
-
 
 def rotation_matrix_to_euler(R):
     """
@@ -902,7 +912,7 @@ def initialize_theta_superparaboloids_pytorch(points, table_normal, rescale=Fals
     y_axis = torch.cross(z_axis, x_axis)
 
     R0 = torch.stack([x_axis, y_axis, z_axis], dim=1)
-    angle = math.radians(8)  # 30° → radians
+    angle = math.radians(0)  # 30° → radians
 
     device = R0.device
     dtype = R0.dtype
@@ -913,11 +923,11 @@ def initialize_theta_superparaboloids_pytorch(points, table_normal, rescale=Fals
         [0.0, math.sin(angle),  math.cos(angle)]
     ], device=device, dtype=dtype)
     
-    Ry90 = torch.tensor([
-    [0.0, 0.0,  1.0],
-    [0.0, 1.0,  0.0],
-    [-1.0, 0.0, 0.0]
-    ], device=R0.device, dtype=R0.dtype)
+    # Ry90 = torch.tensor([
+    # [0.0, 0.0,  1.0],
+    # [0.0, 1.0,  0.0],
+    # [-1.0, 0.0, 0.0]
+    # ], device=R0.device, dtype=R0.dtype)
 
     # Apply rotation
     R0_rotated = Rx@R0   # or Rx90 @ R0 depending on convention
@@ -1008,14 +1018,10 @@ def initialize_theta_pytorch(points, rescale=True):
     # 3. PCA (Eigen decomposition)
     centered = points_centered
     cov = centered.T @ centered / centered.shape[0]
-    print("cov: ", cov)
     eigvals, eigvecs = torch.linalg.eig(cov)  # Eigh is symmetric, fast
-    print("eigVals: ", eigvals)
-    print("eigVecs: ", eigvecs)
+
     idx = torch.argsort(eigvals.real, descending=True)
     eigvecs = eigvecs[:, idx]  # Sorted eigenvectors
-    print(idx)
-    print("eigvecs: ", eigvecs)
 
     # 4. Build initial rotation matrix
     # Same as article: [-EigVec[:, 0], -EigVec[:, 2], cross(EigVec[:,0],EigVec[:,2])]
@@ -1024,14 +1030,26 @@ def initialize_theta_pytorch(points, rescale=True):
     y_axis = torch.cross(eigvecs.real[:, 0], eigvecs.real[:, 2])
 
     R0 = torch.stack([x_axis, z_axis, y_axis], dim=1)  # 3x3 matrix
-    print("R0: ", R0)
+    
+    # Rx90 = R0.new_tensor([[1., 0., 0.],
+    #                   [0., 0., -1.],
+    #                   [0., 1.,  0.]])
+
+    # # Rotate the frame’s axes by +90° around x:
+    # R0 = R0 @ Rx90
+    
+    Ry90 = R0.new_tensor([[0., 0., 1.],
+                      [0., 1., 0.],
+                      [-1., 0., 0.]])
+
+    # # # Apply rotation: rotate the local frame’s axes by +90° around Y
+    R0 = R0 #@ Ry90
     # print("R0: ", R0)
     # 5. Rotate points
     points_rot0 = points_centered @ R0
 
     V = BoundVolume(points_rot0)
     
-    print("BoundVolume: ", V)
     
     p0= 1/V
     
@@ -1041,14 +1059,14 @@ def initialize_theta_pytorch(points, rescale=True):
     s0 = torch.median(points_rot0.abs(), dim=0).values
 
     # 7. Initial parameters
-    e1 = torch.tensor(1.0, device=device)
-    e2 = torch.tensor(1.5, device=device)
-    a1, a2, a3 = s0[0]/2.0, s0[1]/2.0, s0[2]/2.0
+    e1 = torch.tensor(1.1, device=device)
+    e2 = torch.tensor(1.1, device=device)
+    a1, a2, a3 = s0[0], s0[1], s0[2]
 
-    print(a1, a2, a3)
+    # print(a1, a2, a3)
     # 8. Get initial rotation as Euler angles
     euler_angles = rotation_matrix_to_euler(R0)
-    print("euler angles: ", euler_angles)
+    # print("euler angles: ", euler_angles)
     # 9. Initial translation (zero because points centered)
     translation = torch.zeros(3, device=device)
 
@@ -1296,7 +1314,7 @@ def fitting_loss(points, theta, p, distances):
     extent_penalty = overshoot ** 2 * penalty_weight
     # p = weights
     
-    allowed_margin = 0.01  # small tolerance below point cloud
+    allowed_margin = 0.005  # small tolerance below point cloud
     shape_base_z = t[2]
     min_z_points = points_local[:, 2].min()
 
@@ -1335,7 +1353,7 @@ def active_idx_ellipsoid(points, theta, factor=2.0, pad=0.2):
 
 def sq_inside_near_only(points, theta, b, alpha, far_const=20.0):
     # máscara dinámica en *cada* iteración
-    idx = active_idx_ellipsoid(points, theta, factor=2.0, pad=0.3)
+    idx = active_idx_ellipsoid(points, theta, factor=1.5, pad=0.2)
 
     F = torch.full((points.shape[0],), float(far_const), device=points.device)
     if idx.numel() == 0:
@@ -1840,9 +1858,9 @@ def fit_multiple_shape_to_clusters(clusters_points_np, label="root", depth=0, ma
                   sigma2_new = 2 * torch.sum(p * distances ** 2) / (3 * torch.sum(p) + 1e-8)
                   sigma2s[i] = 0.8 * sigma2s[i] + 0.2 * sigma2_new
 
-              theta[0].clamp_(0.01, 2.0)
-              theta[1].clamp_(0.01, 2.0)
-              theta[2:5].clamp_(0.001, 1.5)
+              theta[0].clamp_(0.001, 2.0)
+              theta[1].clamp_(0.001, 2.0)
+              theta[2:5].clamp_(0.001, 2.0)
               theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
 
       if step % 50 == 0:
@@ -2417,6 +2435,21 @@ def initialize_theta_supertoroid_pytorch(points,
             x_axis = F.normalize(torch.cross(ref, z_axis), dim=0)
             y_axis = torch.cross(z_axis, x_axis)
             R0 = torch.stack([x_axis, y_axis, z_axis], dim=1)  # columns
+            angle = 0
+            Rx = torch.tensor([
+            [1.0, 0.0, 0.0],
+            [0.0, math.cos(angle), -math.sin(angle)],
+            [0.0, math.sin(angle),  math.cos(angle)]
+            ], device=device, dtype=dtype)
+        
+            # Ry90 = torch.tensor([
+            # [0.0, 0.0,  1.0],
+            # [0.0, 1.0,  0.0],
+            # [-1.0, 0.0, 0.0]
+            # ], device=R0.device, dtype=R0.dtype)
+
+            # Apply rotation
+            R0= Rx@R0   # or Rx90 @ R0 depending on convention
         else:
             # PCA: smallest-variance eigenvector ≈ ring axis
             X = points_centered
@@ -2440,13 +2473,23 @@ def initialize_theta_supertoroid_pytorch(points,
 
     # 5) robust size estimates
     r_xy = torch.linalg.norm(points_local[:, :2], dim=1)       # ring radius per point
-    Rmaj = torch.median(r_xy)                                   # major radius
+    Rmaj = torch.median(r_xy)                                  # major radius
     a_r  = torch.median((r_xy - Rmaj).abs()).clamp_min(1e-4)    # tube radius in-plane
     a_z  = torch.median(points_local[:, 2].abs()).clamp_min(1e-4)  # tube radius vertical
 
-    # keep a real hole (avoid self-intersection)
-    Rmaj = torch.maximum(Rmaj, a_r + torch.tensor(1e-3, device=device, dtype=dtype))
 
+    # encogimiento (ajusta a gusto)
+    shrink_R  = 1.4   # encoge R
+    shrink_ar = 1.4   # encoge el tubo radial
+    shrink_az = 2.5   # encoge vertical
+
+    Rmaj = Rmaj * shrink_R
+    a_r  = a_r * shrink_ar
+    a_z  = a_z * shrink_az
+
+    # garantiza agujero claro tras encoger
+    margin = 0.3
+    Rmaj = torch.maximum(Rmaj, (1.0 + margin) * a_r)
     # 6) mixture/variance init like your other inits
     V = BoundVolume(points_local)             # your helper (axis-aligned bbox volume)
     p0 = (1.0 / V).clamp_min(1e-12)
@@ -2454,7 +2497,7 @@ def initialize_theta_supertoroid_pytorch(points,
 
     # 7) exponents (start circular)
     e_eta   = torch.tensor(1.0, device=device, dtype=dtype)     # tube superellipse
-    e_omega = torch.tensor(1.4, device=device, dtype=dtype)     # ring superellipse
+    e_omega = torch.tensor(1.1, device=device, dtype=dtype)     # ring superellipse
 
     # 8) translation is zero in centered frame
     translation = torch.zeros(3, device=device, dtype=dtype)
@@ -2489,10 +2532,17 @@ def compute_p_from_dist(distances, sigma2, p0, w=0.1):
     p = dist_term / (const + dist_term)
     return torch.clamp(p, min=1e-3), const
 
-def free_space_loss(ray_samples_flat, theta, b, alpha, number_of_rays):
+
+
+def free_space_loss(ray_samples_flat, theta, b, alpha, number_of_rays, sharpness=20.0, hinge_weight=1.0):
     inside_score = sq_inside_near_only(ray_samples_flat, theta, b, alpha)
-    soft_inside = torch.sigmoid(-(inside_score - 1.0) * 20.0)
-    return soft_inside.view(number_of_rays, -1).max(dim=1).values.mean()
+    soft_inside = torch.sigmoid(-(inside_score - 1.0) * sharpness)
+    
+    violation = torch.relu(1.0 - inside_score)   # 0 on/outside, grows linearly deeper inside
+    penalty = soft_inside + hinge_weight * violation
+
+    return penalty.view(number_of_rays, -1).max(dim=1).values.mean()
+
 
 def sq_F(points, theta):
     R = build_rotation_matrix(theta[5:8])
@@ -2773,7 +2823,7 @@ def dump_topk_near(d, p, points_local=None, k=100, name="", exclude_zeros=False)
 
         # quick stats on valid set
         qs = torch.quantile(d_valid, torch.tensor([0.5, 0.9, 0.999], device=d_valid.device))
-        frac_hi = (p_valid[idx_local] > 0.9).float().mean().item()
+        frac_hi = (p_valid[idx_local] > 0.90).float().mean().item()
 
         print(f"\n-- Top-{k} nearest {name} --")
         print(f"d quantiles: p50={qs[0]:.4f}  p90={qs[1]:.4f}  p99={qs[2]:.4f}  (meters)")
@@ -2804,7 +2854,7 @@ def dump_topk_far(d, p, points_local=None, k=100, name=""):
 
         # quick stats
         qs = torch.quantile(d, torch.tensor([0.5, 0.9, 0.999], device=d.device))
-        frac_hi = (p[idx] > 0.9).float().mean().item()
+        frac_hi = (p[idx] > 0.90).float().mean().item()
 
         print(f"\n-- Top-{k} farthest {name} --")
         print(f"d quantiles: p50={qs[0]:.4f}  p90={qs[1]:.4f}  p99={qs[2]:.4f}  (meters)")
@@ -2838,8 +2888,13 @@ def _dump_yaml(obj, path: Path):
 
 
 
-def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=None, plane_model = None):
-  
+def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=None, plane_model = None, N_ref=None,
+                         all_points = None, number_samples_per_ray=None, base_lr=None, T=None, K=None, sigma_momentum=None, sigma_every=None,
+                         lambda_free= None, lambda_transverse_table=None, lambda_mass=None, w0=None, w_final=None, ramp_start=None,
+                         T_supertoroid=None, lambda_free_supertoroid=None, lambda_transverse_table_supertoroid= None,
+                         T_superparaboloid=None, table_normal=None, weight_decay=None):
+    print("N_ref:",N_ref)
+    lr, weight_decay = lr_wd_from_N(cluster_points_np.size,N_ref=N_ref, lr_ref=0.01)
     # --- START TIMER ---
     torch.cuda.synchronize()
     t0_time = time.perf_counter()
@@ -2849,24 +2904,31 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
     points = torch.tensor(cluster_points_np, dtype=torch.float32, device='cuda')
     
     print("cluster: ", cluster_points_np.size)
-
+        
+        
     points_centered,theta,_, p0, sigma2, t0 = initialize_theta_pytorch(points, False)
-
-    print("Initial p0: ", p0)
-    print("Initial sigma2: ", sigma2)
+    theta0 = theta.detach().clone()
+    # torch.cuda.synchronize()
+    # elapsed = time.perf_counter() - t0_time
+    # print("Initialize theta: ", elapsed)
+    # print("Initial p0: ", p0)
+    # print("Initial sigma2: ", sigma2)
     #################################### BENDING #####################################
-    alpha = torch.tensor(1.57079632679/2.0, device=theta.device)
-    alpha = torch.nn.Parameter(alpha)
-    H= theta[4]
-    r_max = torch.max(theta[2], theta[3])   # conservative
+    # alpha = torch.tensor(1.57079632679/2.0, device=theta.device)
+    # alpha = torch.nn.Parameter(alpha)
+    # H= theta[4]
+    # r_max = torch.max(theta[2], theta[3])   # conservative
 
-    b_phase_max = 1.5 / (H + 1e-6)
-    b_geom_max  = 0.8 / (r_max + 1e-6)
-    b_max = torch.minimum(b_phase_max, b_geom_max)
+    # b_phase_max = 1.5 / (H + 1e-6)
+    # b_geom_max  = 0.8 / (r_max + 1e-6)
+    # b_max = torch.minimum(b_phase_max, b_geom_max)
 
-    # init (if you're creating b here)
-    b = torch.tensor(0.05, device=theta.device) * b_max.detach()
-    b = torch.nn.Parameter(b)
+    # # init (if you're creating b here)
+    # b = torch.tensor(0.05, device=theta.device) * b_max.detach()
+    # b = torch.nn.Parameter(b)
+    
+    alpha = None
+    b = None
     # #################################### BENDING #####################################
     
     a,bp,c,d = plane_model
@@ -2878,7 +2940,7 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
         plane_d=torch.tensor(float(d), device=theta.device),
         half_size=1.0,      # ±1 m in both in-plane directions
         step=0.01,          # 2 cm spacing; adjust as you like
-        offset_above=0.005,    # or e.g. 0.005 to sit 5 mm above the plane
+        offset_above=0.01,    # or e.g. 0.005 to sit 5 mm above the plane
     )
     
     
@@ -2892,7 +2954,7 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
     cos_angles = (cluster_vecs @ center_dir)
     max_angle = torch.acos(torch.clamp(cos_angles.min(), -1.0, 1.0))  # in radians
     
-    margin = 15 * torch.pi / 180  # radians
+    margin = 20 * torch.pi / 180  # radians
     final_cone_angle = max_angle + margin
     cos_thresh = torch.cos(final_cone_angle)
 
@@ -2923,7 +2985,7 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
     directions = points_in_cone - camera_origin  # or just points if origin is (0,0,0)
 
     # Now sample along these rays
-    number_samples_per_ray = number_samples_per_ray_
+    number_samples_per_ray = number_samples_per_ray
     number_of_rays = points_in_cone.shape[0]
     
     print("Points in cone:", len(points_in_cone))
@@ -2937,11 +2999,13 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
     current_ray_samples_flat = ray_points.reshape(-1, 3) - t0
     
     
+
+    
     S = number_samples_per_ray  # you can keep or reduce (e.g., 64–128)
     t_vals = torch.linspace(0.5, 0.99, S, device=directions.device)
 
     R = directions.shape[0]
-    chunk = min(1024, R)  # rays per step
+    chunk = min(512, R)  # rays per step
     g = torch.Generator(device=directions.device).manual_seed(0)  # optional determinism
     perm = torch.randperm(R, generator=g, device=directions.device)
     n_chunks = (R + chunk - 1) // chunk
@@ -2963,31 +3027,18 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
     iter_sigma = 0
 
     table_pts = points_in_cone_table_pts - t0
-    N_ref = N_ref_
+    N_ref = N_ref
     N_cluster = cluster_points_np.shape[0]
     
-    base_lr = base_lr_
+    base_lr = base_lr
     lr = base_lr * min(1.0, N_cluster / N_ref)
     
-    T = T_
-    K=K_
-    freeze_every = T_
-    sigma_momentum = sigma_momentum_
-    sigma_every = sigma_every_
-    lambda_free = lambda_free_
-    lambda_transverse_table = lambda_transverse_table_
-    lambda_mass = lambda_mass_
-    w0=w0_
+
+    freeze_every = T
     w = w0
-    w_final = w_final_
-    ramp_start = ramp_start_
     theta_prev = None
     
-    T_supertoroid = T_supertoroid_
-    lambda_free_supertoroid = lambda_free_supertoroid_
-    lambda_transverse_table_supertoroid = lambda_transverse_table_supertoroid_
     
-    T_superparaboloid = T_superparaboloid_
 
     # justo antes de devolver / terminar:
     torch.cuda.synchronize()
@@ -2995,12 +3046,26 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
     
     loss_history = []   
     run_id = str(uuid.uuid4())[:8]
+    free_cached = torch.zeros((), device=theta.device)  # scalar tensor
+    table_cached = torch.zeros((), device=theta.device)  # scalar tensor
 
     print(f"[initialization] elapsed: {elapsed:.3f} s")
+    
+    raw_log = []
+      
     if shape == 'superquadric':
-        optimizer = torch.optim.Adam([theta], lr=lr, weight_decay=weight_decay_)
+      
+        optimizer = torch.optim.Adam([theta], lr=lr, weight_decay=weight_decay)
 
         prev_loss = None
+        free_step = 0
+        
+        prev_loss_check = None
+        patience_counter = 0
+        patience_limit = 10      # nº de checks consecutivos sin mejora antes de parar
+        check_every = 100        # cada cuántas iteraciones comprobamos convergencia
+        min_iters = 500           # no permitir parar antes de esto, para dar margen al warm-up de w0->w_final
+        
         for outer in range(T):
             if outer % freeze_every == 0:
                 print("One e-step multiple M-steps")
@@ -3011,7 +3076,7 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                 s = max(0.0, (t-ramp_start)/(1-ramp_start))
                 w = (1.0-s)*w0+s*w_final
                 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 # torch.cuda.synchronize()
                 # t_d0 = time.perf_counter()
                 d = sq_distances(points_centered, theta)  # shape (N,)
@@ -3035,67 +3100,151 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                 # torch.cuda.synchronize()
                 # elapsed = time.perf_counter() - t_fit0
                 # print(f"[sq_fit] elapsed: {elapsed:.5f} s")
-                step_mod = outer % n_chunks
-                if step_mod == 0 and outer > 0:
-                    perm = torch.randperm(R, generator=g, device=directions.device)
-                
-                
-                ray_ids = perm[step_mod*chunk : min((step_mod+1)*chunk, R)]  # (M,)
-                dirs = directions[ray_ids]                                   # (M,3)
-                orig = camera_origin[ray_ids]                                # (M,3)
 
-                ray_pts = orig[:, None, :] + t_vals[None, :, None] * dirs[:, None, :]   # (M,S,3)
-                current_ray_samples_flat = (ray_pts.reshape(-1, 3) - t0)                # (M*S,3)
+                # free = free_space_loss(current_ray_samples_flat, theta, b, alpha, ray_ids.numel())
                 
-                free = free_space_loss(current_ray_samples_flat, theta, b, alpha, ray_ids.numel())
-                
-                table_loss = table_transverse_loss(table_pts, theta)
-                #table_loss = 0
-                # free = 0
-                # print("table loss:", table_loss)
-                # print("fit loss", fit)
-                # print("free loss: ", free)
-                # print("Lmass: ", L_mass)
-                loss = fit + lambda_free * free + lambda_transverse_table*table_loss
+                if outer %2 == 0 or outer ==0:
+                    step_mod = free_step % n_chunks
+                    if step_mod == 0 and outer > 0:
+                        perm = torch.randperm(R, generator=g, device=directions.device)
+                    
+                    
+                    ray_ids = perm[step_mod*chunk : min((step_mod+1)*chunk, R)]  # (M,)
+                    
+
+        
+                    free_step += 1
+                    dirs = directions[ray_ids]                                   # (M,3)
+                    orig = camera_origin[ray_ids]                                # (M,3)
+
+                    ray_pts = orig[:, None, :] + t_vals[None, :, None] * dirs[:, None, :]   # (M,S,3)
+                    current_ray_samples_flat = (ray_pts.reshape(-1, 3) - t0)                # (M*S,3)
+
+                    # torch.cuda.synchronize()
+                    # t_free0 = time.perf_counter()
+                    free = free_space_loss(current_ray_samples_flat, theta, b, alpha, ray_ids.numel())
+                    # torch.cuda.synchronize()
+                    # elapsed = time.perf_counter() - t_free0
+                    # print(f"[free_space_loss] elapsed: {elapsed:.5f} s")
+                    free_cached = free.detach()
+                    
+                    # with torch.no_grad():
+                    #     raw_scores = sq_inside_near_only(current_ray_samples_flat, theta, b, alpha)
+                    #     worst_F = raw_scores.min().item()
+                    #     soft_worst = torch.sigmoid(-(raw_scores.min() - 1.0) * 20.0).item()
+                    #     violation_worst = torch.relu(1.0 - raw_scores.min()).item()
+                        # print(f"[free-space] outer={outer} "
+                        #       f"free={free.item():.6f} "
+                        #       f"worst_F={worst_F:.4f} "
+                        #       f"soft_inside(worst)={soft_worst:.6f} "
+                        #       f"violation(worst)={violation_worst:.4f}")
+
+                    # torch.cuda.synchronize()
+                    # t_table0 = time.perf_counter()
+                    table_loss = table_transverse_loss(table_pts, theta)
+                    # torch.cuda.synchronize()
+                    # elapsed = time.perf_counter() - t_table0
+                    # print(f"[table_transverse_loss] elapsed: {elapsed:.5f} s")
+                    table_cached = table_loss.detach()
+
+                    loss = fit + lambda_free * free + lambda_transverse_table*table_loss
+                    # print(f"free_step={free_step}, step_mod={step_mod}, n_chunks={n_chunks}")
+                else:
+                    free = free_cached
+                    table_loss = table_cached
+                    # table_loss = table_transverse_loss(table_pts, theta)
+                    loss = fit + lambda_free * free + lambda_transverse_table*table_loss
+
+
                 
                 # ----- LOG -----
-                log_row = {
-                    "iter": int(outer),
-                    "shape": "superquadric",
-                    "fit": _to_float(fit),
-                    "free": _to_float(lambda_free * free),
-                    "table": _to_float(lambda_transverse_table * table_loss),
-                    "loss": _to_float(loss),
-                    "p_mean": _to_float(p.mean()),
-                    "p_med":  _to_float(p.median()),
-                    "sigma2": _to_float(sigma2),
-                }
-                loss_history.append(log_row)
-# --------------
+                # log_row = {
+                #     "iter": int(outer),
+                #     "shape": "superquadric",
+                #     "fit": _to_float(fit),
+                #     "free": _to_float(lambda_free * free),
+                #     "table": _to_float(lambda_transverse_table * table_loss),
+                #     "loss": _to_float(loss),
+                #     "p_mean": _to_float(p.mean()),
+                #     "p_med":  _to_float(p.median()),
+                #     "sigma2": _to_float(sigma2),
+                # }
+                # with torch.no_grad():
+                #     raw_scores = sq_inside_near_only(current_ray_samples_flat, theta, b, alpha)
+                #     free_worst_F = raw_scores.min()
+                
+                
+                # log_row = {
+                #     "iter": int(outer),
+                #     "shape": "superquadric",
+                #     "fit_raw": _to_float(fit),
+                #     "free_raw": _to_float(free),
+                #     "table_raw": _to_float(table_loss),
+                #     "fit_weighted": _to_float(fit),                               # weight is 1.0
+                #     "free_weighted": _to_float(lambda_free * free),
+                #     "table_weighted": _to_float(lambda_transverse_table * table_loss),
+                #     "loss": _to_float(loss),
+                #     "p_mean": _to_float(p.mean()),
+                #     "p_med":  _to_float(p.median()),
+                #     "sigma2": _to_float(sigma2),
+                #     "free_worst_F": _to_float(free_worst_F),                
+                # }
+                # loss_history.append(log_row)
+                
+                ##### DESCOMENTAR PARA SACAR DATOS NO SOLO TIEMPOS 
+                # with torch.no_grad():
+                #     raw_scores = sq_inside_near_only(current_ray_samples_flat, theta, b, alpha)
+                #     free_worst_F = raw_scores.min()
+
+                # raw_log.append({
+                #     "iter": outer,
+                #     "shape": "superquadric",
+                #     "fit_raw": fit.detach(),
+                #     "free_raw": free.detach(),
+                #     "table_raw": table_loss.detach(),
+                #     "fit_weighted": fit.detach(),
+                #     "free_weighted": (lambda_free * free).detach(),
+                #     "table_weighted": (lambda_transverse_table * table_loss).detach(),
+                #     "loss": loss.detach(),
+                #     "p_mean": p.mean().detach(),
+                #     "p_med": p.median().detach(),
+                #     "sigma2": sigma2.detach() if torch.is_tensor(sigma2) else sigma2,
+                #     "free_worst_F": free_worst_F,
+                # })
+                # --------------
 
                 # print("Loss: ", loss)
                 # torch.cuda.synchronize()
                 # t_0 = time.perf_counter()
+                
                 loss.backward()
+                # torch.cuda.synchronize()
+                # elapsed = time.perf_counter() - t_0
+                # print("outer: ", outer)
+                # print(f"[optimizer backward] elapsed: {elapsed:.5f} s")
+                
+                # torch.cuda.synchronize()
+                # t_0 = time.perf_counter()
                 optimizer.step()
                 # torch.cuda.synchronize()
                 # elapsed = time.perf_counter() - t_0
-                # print(f"[optimizer] elapsed: {elapsed:.5f} s")
+                # print(f"[optimizer step] elapsed: {elapsed:.5f} s")
+                
                 if (outer % sigma_every) == 0:
                     with torch.no_grad():
-                        torch.cuda.synchronize()
-                        t_sigma20 = time.perf_counter()
+                        # torch.cuda.synchronize()
+                        # t_sigma20 = time.perf_counter()
                         sigma2_new = 2 * torch.sum(p * d**2) / (3 * torch.sum(p) + 1e-8)
 
                         sigma2 = sigma_momentum * sigma2 + (1.0 - sigma_momentum) * sigma2_new
-                        torch.cuda.synchronize()
+                        # torch.cuda.synchronize()
                         # elapsed = time.perf_counter() - t_sigma20
                         # print(f"[sigma2] elapsed: {elapsed:.5f} s")       
                 with torch.no_grad():
-                    theta[0].clamp_(0.0001, 1.99)
-                    theta[1].clamp_(0.0001, 1.99)
+                    theta[0].clamp_(0.001, 1.99)
+                    theta[1].clamp_(0.001, 1.99)
                     theta[2:5].clamp_(0.0001, 1.99)
-                    theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
+                    #theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
 
                 # c = (2 * np.pi * float(sigma2))**(-1.5)
                 # pmax0 = 1.0 / (1.0 + float(const))
@@ -3105,14 +3254,49 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                 
                 if outer % 100 == 0:
                     print(f"outer {outer}: Loss = {loss.item()}")
+                    
+                # ---- EARLY STOPPING ----
+                if outer % check_every == 0 and outer >= min_iters:
+                    current_loss = loss.item()   # un solo .item() cada check_every iteraciones, coste despreciable
+                    if prev_loss_check is not None:
+                        rel_improvement = abs(prev_loss_check - current_loss) / (abs(prev_loss_check) + 1e-8)
+                        if rel_improvement < 1e-4:
+                            patience_counter += 1
+                        else:
+                            patience_counter = 0
+                    prev_loss_check = current_loss
 
+                    if patience_counter >= patience_limit:
+                        print(f"[early stop] outer={outer}, loss={current_loss:.6f}, converged (patience={patience_limit})")
+                        break
+        # for entry in raw_log:
+        #     log_row = {
+        #         "iter": int(entry["iter"]),
+        #         "shape": entry["shape"],
+        #         "fit_raw": _to_float(entry["fit_raw"]),
+        #         "free_raw": _to_float(entry["free_raw"]),
+        #         "table_raw": _to_float(entry["table_raw"]),
+        #         "fit_weighted": _to_float(entry["fit_weighted"]),
+        #         "free_weighted": _to_float(entry["free_weighted"]),
+        #         "table_weighted": _to_float(entry["table_weighted"]),
+        #         "loss": _to_float(entry["loss"]),
+        #         "p_mean": _to_float(entry["p_mean"]),
+        #         "p_med": _to_float(entry["p_med"]),
+        #         "sigma2": _to_float(entry["sigma2"]),
+        #         "free_worst_F": _to_float(entry["free_worst_F"]),
+        #     }
+        #     loss_history.append(log_row)
         theta_np = theta.detach().cpu().numpy()
         theta = theta.clone()  # (optional if you're not sure)
         theta[8:11] = theta[8:11] + t0
         theta_np = theta.detach().cpu().numpy()
         print(theta_np)
-        b_np = b.detach().cpu().numpy()
-        alpha_np = alpha.detach().cpu().numpy()
+        # b_np = b.detach().cpu().numpy()
+        # alpha_np = alpha.detach().cpu().numpy()
+        
+        # theta_np[2] = theta0[2].item()
+        # theta_np[3] = theta0[3].item()
+        # theta_np[4] = theta0[4].item()
 
         b_np = 0.0
         alpha_np = 0.0
@@ -3157,7 +3341,7 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
             print("After optimization checking rays: ", free_space_penalty1)
     elif shape == 'supertoroid':
         points_centered,theta,_, p0, sigma2, t0 = initialize_theta_supertoroid_pytorch(points, table_normal,False)
-        optimizer_supertoroid = torch.optim.Adam([theta], lr = lr, weight_decay=weight_decay_)
+        optimizer_supertoroid = torch.optim.Adam([theta], lr = lr, weight_decay=weight_decay)
 
         for outer in range(T_supertoroid):
             optimizer_supertoroid.zero_grad()
@@ -3188,18 +3372,48 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
             # table_loss = 0.0
             loss = fit + lambda_transverse_table_supertoroid*table_loss + lambda_free_supertoroid*free
             
-            log_row = {
-                "iter": int(outer),
+            # log_row = {
+            #     "iter": int(outer),
+            #     "shape": "supertoroid",
+            #     "fit": _to_float(fit),
+            #     "free": _to_float(lambda_free_supertoroid * free),
+            #     "table": _to_float(lambda_transverse_table_supertoroid * table_loss),
+            #     "loss": _to_float(loss),
+            #     "p_mean": _to_float(p.mean()),
+            #     "p_med":  _to_float(p.median()),
+            #     "sigma2": _to_float(sigma2),
+            # }
+            # loss_history.append(log_row)
+            
+            with torch.no_grad():
+                raw_scores = st_inside_near_only(current_ray_samples_flat, theta)
+                free_worst_F = raw_scores.min()
+
+            # log_row = {
+            #     "iter": int(outer),
+            #     "shape": "supertoroid",
+            #     "fit": _to_float(fit),
+            #     "free": _to_float(lambda_free_supertoroid * free),
+            #     "table": _to_float(lambda_transverse_table_supertoroid * table_loss),
+            #     "loss": _to_float(loss),
+            #     "p_mean": _to_float(p.mean()),
+            #     "p_med":  _to_float(p.median()),
+            #     "sigma2": _to_float(sigma2),
+            #     "free_worst_F": _to_float(free_worst_F),
+            # }
+            # loss_history.append(log_row)
+            raw_log.append({
+                "iter": outer,
                 "shape": "supertoroid",
-                "fit": _to_float(fit),
-                "free": _to_float(lambda_free_supertoroid * free),
-                "table": _to_float(lambda_transverse_table_supertoroid * table_loss),
-                "loss": _to_float(loss),
-                "p_mean": _to_float(p.mean()),
-                "p_med":  _to_float(p.median()),
-                "sigma2": _to_float(sigma2),
-            }
-            loss_history.append(log_row)
+                "fit": fit.detach(),
+                "free": (lambda_free_supertoroid * free).detach(),
+                "table": (lambda_transverse_table_supertoroid * table_loss).detach(),
+                "loss": loss.detach(),
+                "p_mean": p.mean().detach(),
+                "p_med": p.median().detach(),
+                "sigma2": sigma2.detach() if torch.is_tensor(sigma2) else sigma2,
+                "free_worst_F": free_worst_F.detach(),
+            })
             
             print("Loss: ", loss)
             loss.backward()
@@ -3213,6 +3427,21 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                 theta[1].clamp_(0.0001, 1.99)
                 theta[2:5].clamp_(0.0001, 1.99)
                 theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
+                
+        for entry in raw_log:
+            log_row = {
+                "iter": int(entry["iter"]),
+                "shape": entry["shape"],
+                "fit": _to_float(entry["fit"]),
+                "free": _to_float(entry["free"]),
+                "table": _to_float(entry["table"]),
+                "loss": _to_float(entry["loss"]),
+                "p_mean": _to_float(entry["p_mean"]),
+                "p_med": _to_float(entry["p_med"]),
+                "sigma2": _to_float(entry["sigma2"]),
+                "free_worst_F": _to_float(entry["free_worst_F"]),
+            }
+            loss_history.append(log_row)
                 
         theta_np = theta.detach().cpu().numpy()
         theta = theta.clone()  # (optional if you're not sure)
@@ -3243,15 +3472,15 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
 
     elif shape =='superparaboloid':
         points_centered,theta,_, p0, sigma2, t0 = initialize_theta_superparaboloids_pytorch(points, table_normal, False)
-        k = torch.tensor(0.5)
+        k = torch.tensor(0.2)
         k = torch.nn.Parameter(k)
         p=None
-        optimizer_superparaboloid = torch.optim.Adam([theta,k], lr=lr, weight_decay=weight_decay_)
+        optimizer_superparaboloid = torch.optim.Adam([theta,k], lr=lr, weight_decay=weight_decay)
         for outer in range(T_superparaboloid):
             optimizer_superparaboloid.zero_grad(set_to_none=True)
 
             d = spb_distances_classic(points_centered, theta, k)
-            # d = spb_euclidean_distance(points_centered, theta, k, iters=50)  # <-- esto
+            #d = spb_euclidean_distance(points_centered, theta, k, iters=50)  # <-- esto
             # Clamp theta values to stay valid
             with torch.no_grad():
                 
@@ -3272,18 +3501,41 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                 
 
             loss, fit, drop_penaly, extend_penalty = fitting_loss(points_centered, theta, p, d)
-            log_row = {
-                "iter": int(outer),
+            # log_row = {
+            #     "iter": int(outer),
+            #     "shape": "superparaboloid",
+            #     "fit": _to_float(fit),
+            #     "drop": _to_float(drop_penaly),
+            #     "extend": _to_float(extend_penalty),
+            #     "loss": _to_float(loss),
+            #     "p_mean": _to_float(p.mean()),
+            #     "p_med":  _to_float(p.median()),
+            #     "sigma2": _to_float(sigma2),
+            # }
+            # loss_history.append(log_row)
+            # log_row = {
+            #     "iter": int(outer),
+            #     "shape": "superparaboloid",
+            #     "fit": _to_float(fit),
+            #     "drop": _to_float(drop_penaly),
+            #     "extend": _to_float(extend_penalty),
+            #     "loss": _to_float(loss),
+            #     "p_mean": _to_float(p.mean()),
+            #     "p_med":  _to_float(p.median()),
+            #     "sigma2": _to_float(sigma2),
+            # }
+            # loss_history.append(log_row)
+            raw_log.append({
+                "iter": outer,
                 "shape": "superparaboloid",
-                "fit": _to_float(fit),
-                "drop": _to_float(drop_penaly),
-                "extend": _to_float(extend_penalty),
-                "loss": _to_float(loss),
-                "p_mean": _to_float(p.mean()),
-                "p_med":  _to_float(p.median()),
-                "sigma2": _to_float(sigma2),
-            }
-            loss_history.append(log_row)
+                "fit": fit.detach(),
+                "drop": drop_penaly.detach(),
+                "extend": extend_penalty.detach(),
+                "loss": loss.detach(),
+                "p_mean": p.mean().detach(),
+                "p_med": p.median().detach(),
+                "sigma2": sigma2.detach() if torch.is_tensor(sigma2) else sigma2,
+            })
             # loss_per_iteration.append(loss.item())  # Save it for plotting later
             loss.backward()
             optimizer_superparaboloid.step()
@@ -3304,14 +3556,27 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                 
                 # Optionally clamp rotation angles between [-pi, pi]
                 theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
-                
+        
+        for entry in raw_log:
+            log_row = {
+                "iter": int(entry["iter"]),
+                "shape": entry["shape"],
+                "fit": _to_float(entry["fit"]),
+                "drop": _to_float(entry["drop"]),
+                "extend": _to_float(entry["extend"]),
+                "loss": _to_float(entry["loss"]),
+                "p_mean": _to_float(entry["p_mean"]),
+                "p_med": _to_float(entry["p_med"]),
+                "sigma2": _to_float(entry["sigma2"]),
+            }
+            loss_history.append(log_row)
         d = spb_distances_autograd(points_centered, theta, k)
         distances_final = d.detach().cpu().numpy()
         
         dump_topk_near(d, p, points_local=points_centered, k=300, name=f"SPB iter {outer}", exclude_zeros=True)
         dump_topk_far(d, p, points_local=points_centered, k=300, name=f"SPB iter {outer}")
         
-        theta_np = theta.detach().cpu().numpy()
+        theta_np = theta0.detach().cpu().numpy()
         theta = theta.clone()  # (optional if you're not sure)
         theta[8:11] = theta[8:11] + t0
         theta_np = theta.detach().cpu().numpy()
@@ -3337,12 +3602,12 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
         free_space_penalty1 = 0
 
         print("selected_indices_good: ", selected_indices_good)
-
+        
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0_time
     print(f"[fit_shape_to_cluster] elapsed: {elapsed:.3f} s")
 
-    return theta_np,k_np,b_np, alpha_np, selected_indices_good,remaining_indices1, selected_indices_bad, free_space_penalty1, distances_final, loss_history
+    return theta_np,k_np,b_np, alpha_np, selected_indices_good,remaining_indices1, selected_indices_bad, free_space_penalty1, distances_final, loss_history, elapsed
 
 def option1_score(d_squared, idx_inliers, N_total):
     """J = mse * (N_total / |G|).  d_squared is an array of squared residuals."""
@@ -3382,511 +3647,524 @@ def option1_score(d_squared, idx_inliers, N_total):
 #     showPoints(filtered_points, scale_factor=0.005, color=(1,0,0))
 #     mlab.show()
 
+def lr_wd_from_N(N, N_ref=2000, lr_ref=3e-3, wd_ref=1e-3, power=1.0):
+    """
+    If loss is a SUM over points, set:
+      lr = lr_ref * (N_ref / N)^power
+      wd = wd_ref * (N / N_ref)^power   # keeps lr*wd approximately constant
+    Clamp N to a sensible range to avoid extremes.
+    """
+    N_eff = max(300, min(int(N), 6000))
+    scale = (N_ref / float(N_eff))**power
+    lr = lr_ref * scale
+    wd = wd_ref / scale                 # so lr * wd ≈ constant
+    return lr, wd
 
-################ PARAMETERS ###############
-scene_ = "scene_39"
-N_ref_ = 1000
-base_lr_ = 1e-3
-T_ = 3000
-K_=3
-freeze_every_ = T_
-sigma_momentum_ = 0.0    # EMA for sigma2
-sigma_every_ = 1         # update cadence
-lambda_free_ = 120.0
-lambda_transverse_table_ = 10.0
-lambda_mass_ = 0.0
-w0_=0.05
-w_final_ = 0.35
-ramp_start_ = 0.7
-T_supertoroid_ = 1000
-lambda_free_supertoroid_ = 30.0
-lambda_transverse_table_supertoroid_ = 5.0
+# ################ PARAMETERS ###############
+# scene_ = "scene_48"
+# N_ref_ = 1000
+# base_lr_ = 1e-3
+# T_ = 1000
+# K_=3
+# freeze_every_ = T_
+# sigma_momentum_ = 0.0    # EMA for sigma2
+# sigma_every_ = 1         # update cadence
+# lambda_free_ = 120.0
+# lambda_transverse_table_ = 10.0
+# lambda_mass_ = 0.0
+# w0_=0.05
+# w_final_ = 0.35
+# ramp_start_ = 0.7
+# T_supertoroid_ = 100
+# lambda_free_supertoroid_ = 30.0
+# lambda_transverse_table_supertoroid_ = 10.0
 
-T_superparaboloid_ = 4000
-number_samples_per_ray_ = 300
-weight_decay_ = 0.01
+# T_superparaboloid_ = 2000
+# number_samples_per_ray_ = 300
+# weight_decay_ = 0.01
 
-params = {
-    "scene_": scene_,
-    "N_ref_": N_ref_,
-    "base_lr_": base_lr_,
-    "T_": T_,
-    "K_": K_,
-    "freeze_every_": freeze_every_,
-    "sigma_momentum_": sigma_momentum_,
-    "sigma_every_": sigma_every_,
-    "lambda_free_": lambda_free_,
-    "lambda_transverse_table_": lambda_transverse_table_,
-    "lambda_mass_": lambda_mass_,
-    "w0_": w0_,
-    "w_final_": w_final_,
-    "ramp_start_": ramp_start_,
-    "T_supertoroid_": T_supertoroid_,
-    "lambda_free_supertoroid_": lambda_free_supertoroid_,
-    "T_superparaboloid_": T_superparaboloid_,
-    "number_samples_per_ray_": number_samples_per_ray_,
-    "weight_decay_": weight_decay_,
-}
+# params = {
+#     "scene_": scene_,
+#     "N_ref_": N_ref_,
+#     "base_lr_": base_lr_,
+#     "T_": T_,
+#     "K_": K_,
+#     "freeze_every_": freeze_every_,
+#     "sigma_momentum_": sigma_momentum_,
+#     "sigma_every_": sigma_every_,
+#     "lambda_free_": lambda_free_,
+#     "lambda_transverse_table_": lambda_transverse_table_,
+#     "lambda_mass_": lambda_mass_,
+#     "w0_": w0_,
+#     "w_final_": w_final_,
+#     "ramp_start_": ramp_start_,
+#     "T_supertoroid_": T_supertoroid_,
+#     "lambda_free_supertoroid_": lambda_free_supertoroid_,
+#     "T_superparaboloid_": T_superparaboloid_,
+#     "number_samples_per_ray_": number_samples_per_ray_,
+#     "weight_decay_": weight_decay_,
+# }
 
-base_path = "/home/elisabeth/repos/ProbabilisticSuperquadricFitting/results"
+# base_path = "/home/elisabeth/repos/ProbabilisticSuperquadricFitting/results"
 
-scene_dir = Path(base_path) / scene_
-scene_dir.mkdir(parents=True, exist_ok=True)
+# scene_dir = Path(base_path) / scene_
+# scene_dir.mkdir(parents=True, exist_ok=True)
 
-try:
-    test_n  # noqa: F821
-except NameError:
-    test_n = _next_test_num(scene_dir)
+# try:
+#     test_n  # noqa: F821
+# except NameError:
+#     test_n = _next_test_num(scene_dir)
     
-out_dir = scene_dir / f"test{test_n}"
-out_dir.mkdir(exist_ok=True)
+# out_dir = scene_dir / f"test{test_n}"
+# out_dir.mkdir(exist_ok=True)
 
-# --- write params once (won't overwrite if already present)
-params_path = out_dir / "params.yaml"
-if not params_path.exists():
-    run_params = {
-        "scene_": scene_,
-        "N_ref_": N_ref_,
-        "base_lr_": base_lr_,
-        "T_": T_,
-        "K_": K_,
-        "freeze_every_": freeze_every_,
-        "sigma_momentum_": sigma_momentum_,
-        "sigma_every_": sigma_every_,
-        "lambda_free_": lambda_free_,
-        "lambda_transverse_table_": lambda_transverse_table_,
-        "lambda_mass_": lambda_mass_,
-        "w0_": w0_,
-        "w_final_": w_final_,
-        "ramp_start_": ramp_start_,
-        "T_supertoroid_": T_supertoroid_,
-        "lambda_free_supertoroid_": lambda_free_supertoroid_,
-        "T_superparaboloid_": T_superparaboloid_,
-        "number_samples_per_ray_": number_samples_per_ray_,
-        "weight_decay_": weight_decay_,
-    }
-    params_path.write_text("# ################ PARAMETERS ###############\n" + _dump(run_params))
+# # --- write params once (won't overwrite if already present)
+# params_path = out_dir / "params.yaml"
+# if not params_path.exists():
+#     run_params = {
+#         "scene_": scene_,
+#         "N_ref_": N_ref_,
+#         "base_lr_": base_lr_,
+#         "T_": T_,
+#         "K_": K_,
+#         "freeze_every_": freeze_every_,
+#         "sigma_momentum_": sigma_momentum_,
+#         "sigma_every_": sigma_every_,
+#         "lambda_free_": lambda_free_,
+#         "lambda_transverse_table_": lambda_transverse_table_,
+#         "lambda_mass_": lambda_mass_,
+#         "w0_": w0_,
+#         "w_final_": w_final_,
+#         "ramp_start_": ramp_start_,
+#         "T_supertoroid_": T_supertoroid_,
+#         "lambda_free_supertoroid_": lambda_free_supertoroid_,
+#         "T_superparaboloid_": T_superparaboloid_,
+#         "number_samples_per_ray_": number_samples_per_ray_,
+#         "weight_decay_": weight_decay_,
+#     }
+#     params_path.write_text("# ################ PARAMETERS ###############\n" + _dump(run_params))
 
 
-# point_cloud = read_ply("data/objects7.ply")
-# point_cloud = remove_close_points(point_cloud, 0.005)
+# # point_cloud = read_ply("data/objects7.ply")
+# # point_cloud = remove_close_points(point_cloud, 0.005)
 
-# point_cloud = filter_by_z(point_cloud, -np.inf, 1.94)
+# # point_cloud = filter_by_z(point_cloud, -np.inf, 1.94)
 
+# # all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
+
+
+
+# # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# # showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
+
+# point_cloud = read_with_open3d("data/sceneReplica/final_scenes/pcds/"+scene_+"/cloud.pcd")
+# point_cloud = remove_close_points(point_cloud, 0.003)
+# filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.003)
+# filtered_points, plane_points1, plane_model1 = remove_largest_plane(filtered_points, distance_threshold=0.003)
+# point_cloud = filter_by_z(point_cloud, -np.inf, 1.5)
 # all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
 
-
-
-# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-# showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
-
-point_cloud = read_with_open3d("data/sceneReplica/final_scenes/pcds/"+scene_+"/cloud.pcd")
-point_cloud = remove_close_points(point_cloud, 0.003)
-filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.003)
-filtered_points, plane_points1, plane_model1 = remove_largest_plane(filtered_points, distance_threshold=0.003)
-point_cloud = filter_by_z(point_cloud, -np.inf, 1.5)
-all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
-
-# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-# showPoints(filtered_points, scale_factor=0.0025, color=(0,0.5,0.5))
-# showPoints(np.array([[0,0,0]]))
-# mlab.show()
+# # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# # showPoints(filtered_points, scale_factor=0.0025, color=(0,0.5,0.5))
+# # showPoints(np.array([[0,0,0]]))
+# # mlab.show()
 
 
 
 
-print("plane model: ", plane_model)
+# print("plane model: ", plane_model)
 
-table_normal = torch.tensor(plane_model[:3], dtype=torch.float32, device='cuda')
+# table_normal = torch.tensor(plane_model[:3], dtype=torch.float32, device='cuda')
 
-# points_np: (N,3) from your /head_camera/depth_registered/points (same camera!)
-# seg_png: color segmentation aligned with that camera (same resolution)
-labels, id2color = load_seg_as_labels("data/sceneReplica/final_scenes/segmasks/"+scene_+"/gtseg_ord-nearest_first_step-0.png", inflate_px=15)
-point_labels = label_points_from_seg(filtered_points, labels)
-clusters = split_points_by_label(filtered_points, point_labels)
+# # points_np: (N,3) from your /head_camera/depth_registered/points (same camera!)
+# # seg_png: color segmentation aligned with that camera (same resolution)
+# labels, id2color = load_seg_as_labels("data/sceneReplica/final_scenes/segmasks/"+scene_+"/gtseg_ord-nearest_first_step-0.png", inflate_px=10)
+# point_labels = label_points_from_seg(filtered_points, labels)
+# clusters = split_points_by_label(filtered_points, point_labels)
 
-# clusters_pruned, rep = prune_clusters_like(
-#     clusters,
-#     dbscan_min_samples=20,
-#     keep_quantile=0.95,
-#     min_points_after=30,
-#     gap_min=0.01,        # 5 cm gap to drop tiny islands
-#     rel_size_max=0.30    # drop components <20% of main if also far
-# )
+# # clusters_pruned, rep = prune_clusters_like(
+# #     clusters,
+# #     dbscan_min_samples=20,
+# #     keep_quantile=0.95,
+# #     min_points_after=30,
+# #     gap_min=0.01,        # 5 cm gap to drop tiny islands
+# #     rel_size_max=0.30    # drop components <20% of main if also far
+# # )
 
-# # for lab, r in rep.items():
-# #     print(f"label {lab}: {r['orig']} -> {r['kept']} (dropped {r['dropped']})")
+# # # for lab, r in rep.items():
+# # #     print(f"label {lab}: {r['orig']} -> {r['kept']} (dropped {r['dropped']})")
 
-# clusters = clusters_pruned
-print("clusters", clusters)
-# # clusters[k] is Nx3 for each object; id2color[k] gives its RGB color.
+# # clusters = clusters_pruned
+# print("clusters", clusters)
+# # # clusters[k] is Nx3 for each object; id2color[k] gives its RGB color.
 
-# p= None
-# kmeans = KMeans(n_clusters=4).fit(filtered_points)
-# clustering = DBSCAN(eps=0.03, min_samples=6).fit(filtered_points)
-# n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
-# print(f"Number of clusters: {n_clusters}")
+# # p= None
+# # kmeans = KMeans(n_clusters=4).fit(filtered_points)
+# # clustering = DBSCAN(eps=0.03, min_samples=6).fit(filtered_points)
+# # n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
+# # print(f"Number of clusters: {n_clusters}")
 
-camera_origin = torch.zeros_like(all_points)  # shape (N, 3), all (0,0,0)
-directions = all_points - camera_origin  # or just points if origin is (0,0,0)
+# camera_origin = torch.zeros_like(all_points)  # shape (N, 3), all (0,0,0)
+# directions = all_points - camera_origin  # or just points if origin is (0,0,0)
 
-# Now sample along these rays
-number_samples_per_ray = 120
-number_of_rays = all_points.shape[0]
+# # Now sample along these rays
+# number_samples_per_ray = 120
+# number_of_rays = all_points.shape[0]
 
-t_vals = torch.linspace(0.03, 1.1, number_samples_per_ray, device=all_points.device)  # go slightly past the surface
-ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
-ray_samples_flat = ray_points.reshape(-1, 3)
+# t_vals = torch.linspace(0.03, 1.1, number_samples_per_ray, device=all_points.device)  # go slightly past the surface
+# ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
+# ray_samples_flat = ray_points.reshape(-1, 3)
 
-k = torch.tensor(0.6)
-k = torch.nn.Parameter(k)
+# k = torch.tensor(0.6)
+# k = torch.nn.Parameter(k)
 
 
-all_params_modeled = {}
-idx = 0
-# for i in range(0, len(clusters)-1):
-for lid, cluster in clusters.items():
-    print(lid, cluster.shape)                    # each pts is Nx3
-    loss_per_iteration = []
-    if lid ==1 or lid == 2 or lid==3 or lid==4:
-      continue
-    current_cluster = cluster
+# all_params_modeled = {}
+# idx = 0
+# # for i in range(0, len(clusters)-1):
+# for lid, cluster in clusters.items():
+#     print(lid, cluster.shape)                    # each pts is Nx3
+#     loss_per_iteration = []
+#     if lid ==4 or lid ==2 or lid==3 or lid==5:
+#       continue
+#     current_cluster = cluster
 
-    sub_idx = 0
+#     sub_idx = 0
     
-    theta_np_sq = None
-    queue = deque([current_cluster])
+#     theta_np_sq = None
+#     queue = deque([current_cluster])
     
-    while queue:
-        current_cluster = queue.popleft()
-        fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-        mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-        showPoints(current_cluster, scale_factor=0.0025, color = (0.894, 0.447, 0.0))
-        showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-        mlab.show()
+#     while queue:
+#         current_cluster = queue.popleft()
+#         fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+#         mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
+#         showPoints(current_cluster, scale_factor=0.0025, color = (0.894, 0.447, 0.0))
+#         showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
+#         mlab.show()
         
-        if current_cluster.shape[0]<=30:
-          continue
-        theta_np, k_np, b_np, alpha_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty, distances, loss_history_se = fit_shape_to_cluster(current_cluster, 'superquadric', plane_model=plane_model)
-        print("selected indices good: ", selected_indices_good.shape)
-        print("theta_np: ", theta_np)
-        print("b_np: ", b_np)
-        print("alpha_np: ", alpha_np)
+#         if current_cluster.shape[0]<=12:
+#           continue
+#         theta_np, k_np, b_np, alpha_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty, distances, loss_history_se = fit_shape_to_cluster(current_cluster, 'superquadric', plane_model=plane_model)
+#         print("selected indices good: ", selected_indices_good.shape)
+#         print("theta_np: ", theta_np)
+#         print("b_np: ", b_np)
+#         print("alpha_np: ", alpha_np)
         
-        all_params_modeled[idx] = {"cluster": lid,"type": "superquadric", "theta": theta_np, "k": 0, "b": b_np, "alpha": alpha_np, "free_space_penalty":free_space_penalty, 
-                                  "indices_good": selected_indices_good, "indices_bad": selected_indices_bad, "indices_remaining": remaining_indices}
-        idx +=1
+#         all_params_modeled[idx] = {"cluster": lid,"type": "superquadric", "theta": theta_np, "k": 0, "b": b_np, "alpha": alpha_np, "free_space_penalty":free_space_penalty, 
+#                                   "indices_good": selected_indices_good, "indices_bad": selected_indices_bad, "indices_remaining": remaining_indices}
+#         idx +=1
         
-        fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-        mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-        showPoints(current_cluster[selected_indices_good], scale_factor=0.002, color=(1.0, 0.992, 0.157))
-        if selected_indices_bad.size >0:
-            showPoints(current_cluster[selected_indices_bad], scale_factor=0.002, color=(0.224, 0.004, 0.278))
-        showPoints(current_cluster[remaining_indices], scale_factor=0.002, color=(0.243, 0.675, 0.647))
-        showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-        showSuperquadrics(theta_np, b_np, alpha_np)
-        mlab.show()
+#         fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+#         mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
+#         showPoints(current_cluster[selected_indices_good], scale_factor=0.002, color=(1.0, 0.992, 0.157))
+#         if selected_indices_bad.size >0:
+#             showPoints(current_cluster[selected_indices_bad], scale_factor=0.002, color=(0.224, 0.004, 0.278))
+#         showPoints(current_cluster[remaining_indices], scale_factor=0.002, color=(0.243, 0.675, 0.647))
+#         showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
+#         showSuperquadrics(theta_np, b_np, alpha_np)
+#         mlab.show()
         
-        theta_np_sq = theta_np
+#         theta_np_sq = theta_np
+#         # else:
+#         #     theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty = fit_shape_to_cluster(current_cluster, False)
+#         #     current_cluster = current_cluster[selected_indices_bad]
+#         #     all_params_modeled[idx] = {"type": "superparaboloid", "theta": theta_np, "k": k_np}
+#         #     idx+=1
+#             # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+#             # showPoints(cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
+#             # if selected_indices_bad.size >0:
+#             #     showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
+#             # showPoints(cluster[remaining_indices], scale_factor=0.01, color=(0,0,1))
+#             # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
+#             # showTaperedSuperparaboloidWithBase(theta_np,k_np)
+#             # mlab.show()
+        
+        
+#         print("all_params", all_params_modeled)
+#         for id, params in list(all_params_modeled.items())[-1:]:
+#           if params["free_space_penalty"]>=0.015 or params["indices_good"].shape[0] == 0:
+#               print("good: ",params["indices_good"])
+#               print("Before selected indices good: ", params["indices_good"].shape)
+#               print("free_space_penalty: ", params["free_space_penalty"])
+#               # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+#               # showPoints(current_cluster[params["indices_good"]], scale_factor=0.01, color=(0,1,0))
+#               # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
+#               # mlab.show()
+              
+#               good1 = as_idx1d(params["indices_good"])           # from the 1st (SQ) fit, relative to current_cluster
+#               bad1 = as_idx1d(params["indices_bad"])
+#               remaining_indices1  = as_idx1d(params["indices_remaining"])
 
-        # else:
-        #     theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty = fit_shape_to_cluster(current_cluster, False)
-        #     current_cluster = current_cluster[selected_indices_bad]
-        #     all_params_modeled[idx] = {"type": "superparaboloid", "theta": theta_np, "k": k_np}
-        #     idx+=1
-            # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-            # showPoints(cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
-            # if selected_indices_bad.size >0:
-            #     showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
-            # showPoints(cluster[remaining_indices], scale_factor=0.01, color=(0,0,1))
-            # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
-            # showTaperedSuperparaboloidWithBase(theta_np,k_np)
-            # mlab.show()
-        
-        
-        print("all_params", all_params_modeled)
-        for id, params in list(all_params_modeled.items())[-1:]:
-          if params["free_space_penalty"]>=0.015 or params["indices_good"].shape[0] == 0:
-              print("good: ",params["indices_good"])
-              print("Before selected indices good: ", params["indices_good"].shape)
-              print("free_space_penalty: ", params["free_space_penalty"])
-              # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-              # showPoints(current_cluster[params["indices_good"]], scale_factor=0.01, color=(0,1,0))
-              # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
-              # mlab.show()
+#               used_indices = None
+#               # If the first fit had no good points, skip carryover entirely
               
-              good1 = as_idx1d(params["indices_good"])           # from the 1st (SQ) fit, relative to current_cluster
-              bad1 = as_idx1d(params["indices_bad"])
-              remaining_indices1  = as_idx1d(params["indices_remaining"])
+#               print("good1.size: ", good1.size)
+#               if good1.size == 0:
+#                   remaining_indices_for_toroid = np.union1d(remaining_indices1, bad1)
+#                   used_indices = remaining_indices_for_toroid
+#                   sub_pts = current_cluster[used_indices]
+#               else:
+#                   used_indices = np.union1d(good1, remaining_indices1)
+#                   sub_pts = current_cluster[used_indices]                  # pass exactly these to the paraboloid fit
+              
+              
+#               # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+#               # showPoints(sub_pts, scale_factor=0.01, color=(0,1,0))
+#               # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
+#               # mlab.show()
+              
+#               theta_np, k_np, b_np, alpha_np, selected_indices_good2, remaining_indices2, selected_indices_bad2, free_space_penalty, distances_st, loss_history_st = fit_shape_to_cluster(sub_pts, 'supertoroid', plane_model=plane_model)
+#               distances_st = distances_st[selected_indices_good2]
+              
+#               d = np.asarray(distances_st).reshape(-1)              # shape (N_sub,)
+#               idx_st = np.asarray(selected_indices_good2, dtype=np.int64)
 
-              used_indices = None
-              # If the first fit had no good points, skip carryover entirely
+#               # Limpieza/seguridad por si viene algún índice fuera de rango
+#               N_st = d.shape[0]
+#               idx_st = idx_st[(idx_st >= 0) & (idx_st < N_st)]
+#               if idx_st.size == 0:
+#                   sum_st_distances_good = float('inf')
+#                   mean_st_distances_good = float('inf')
+#               else:
+#                   # (opcional) quitar duplicados y ordenar
+#                   idx_st = np.unique(idx_st)
+#                   sum_st_distances_good = float(np.nansum(d[idx_st]**2))
+#                   mean_st_distances_good = float(np.nanmean(d[idx_st]**2))
+#                   J_st, G_st, mse_st = option1_score(d**2, selected_indices_good2, sub_pts.shape[0])         
               
-              print("good1.size: ", good1.size)
-              if good1.size == 0:
-                  remaining_indices_for_toroid = np.union1d(remaining_indices1, bad1)
-                  used_indices = remaining_indices_for_toroid
-                  sub_pts = current_cluster[used_indices]
-              else:
-                  used_indices = np.union1d(good1, remaining_indices1)
-                  sub_pts = current_cluster[used_indices]                  # pass exactly these to the paraboloid fit
+              
+#               fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+#               mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
+#               showPoints(sub_pts[selected_indices_good2], scale_factor=0.002, color=(1.0, 0.992, 0.157))
+#               if selected_indices_bad2.size >0:
+#                   showPoints(sub_pts[selected_indices_bad2], scale_factor=0.002, color=(0.224, 0.004, 0.278))
+#               showPoints(sub_pts[remaining_indices2], scale_factor=0.002, color=(0.243, 0.675, 0.647))
+#               showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
+#               showSupertoroid(theta_np)
+#               mlab.show()
               
               
-              # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-              # showPoints(sub_pts, scale_factor=0.01, color=(0,1,0))
-              # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
-              # mlab.show()
-              
-              theta_np, k_np, b_np, alpha_np, selected_indices_good2, remaining_indices2, selected_indices_bad2, free_space_penalty, distances_st, loss_history_st = fit_shape_to_cluster(sub_pts, 'supertoroid', plane_model=plane_model)
-              distances_st = distances_st[selected_indices_good2]
-              
-              d = np.asarray(distances_st).reshape(-1)              # shape (N_sub,)
-              idx_st = np.asarray(selected_indices_good2, dtype=np.int64)
+#               theta_np_sp, k_np_sp, b_np_sp, alpha_np_sp, selected_indices_good2_sp, remaining_indices2_sp, selected_indices_bad2_sp, free_space_penalty_sp, distances_sp, loss_history_sp = fit_shape_to_cluster(sub_pts, 'superparaboloid', plane_model=plane_model)
 
-              # Limpieza/seguridad por si viene algún índice fuera de rango
-              N_st = d.shape[0]
-              idx_st = idx_st[(idx_st >= 0) & (idx_st < N_st)]
-              if idx_st.size == 0:
-                  sum_st_distances_good = float('inf')
-                  mean_st_distances_good = float('inf')
-              else:
-                  # (opcional) quitar duplicados y ordenar
-                  idx_st = np.unique(idx_st)
-                  sum_st_distances_good = float(np.nansum(d[idx_st]**2))
-                  mean_st_distances_good = float(np.nanmean(d[idx_st]**2))
-                  J_st, G_st, mse_st = option1_score(d**2, selected_indices_good2, sub_pts.shape[0])         
-              
-              
-              fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-              mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-              showPoints(sub_pts[selected_indices_good2], scale_factor=0.002, color=(1.0, 0.992, 0.157))
-              if selected_indices_bad2.size >0:
-                  showPoints(sub_pts[selected_indices_bad2], scale_factor=0.002, color=(0.224, 0.004, 0.278))
-              showPoints(sub_pts[remaining_indices2], scale_factor=0.002, color=(0.243, 0.675, 0.647))
-              showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-              showSupertoroid(theta_np)
-              mlab.show()
-              
-              
-              theta_np_sp, k_np_sp, b_np_sp, alpha_np_sp, selected_indices_good2_sp, remaining_indices2_sp, selected_indices_bad2_sp, free_space_penalty_sp, distances_sp, loss_history_sp = fit_shape_to_cluster(sub_pts, 'superparaboloid', plane_model=plane_model)
+#               idx_sp = np.asarray(selected_indices_good2_sp, dtype=np.int64)
 
-              idx_sp = np.asarray(selected_indices_good2_sp, dtype=np.int64)
-
-              # Limpieza/seguridad por si viene algún índice fuera de rango
-              N_sp = d.shape[0]
-              idx_sp = idx_sp[(idx_sp >= 0) & (idx_sp < N_sp)]
-              if idx_sp.size == 0:
-                  sum_sp_distances_good = float('inf')
-                  mean_sp_distances_good = float('inf')
-              else:
-                  # (opcional) quitar duplicados y ordenar
-                  idx_sp = np.unique(idx_sp)
-                  sum_sp_distances_good = float(np.nansum(d[idx_sp]**2))
-                  mean_sp_distances_good = float(np.nanmean(d[idx_sp]**2))
-                  J_sp, G_sp, mse_sp = option1_score(d**2, selected_indices_good2_sp, sub_pts.shape[0])     
+#               # Limpieza/seguridad por si viene algún índice fuera de rango
+#               N_sp = d.shape[0]
+#               idx_sp = idx_sp[(idx_sp >= 0) & (idx_sp < N_sp)]
+#               if idx_sp.size == 0:
+#                   sum_sp_distances_good = float('inf')
+#                   mean_sp_distances_good = float('inf')
+#               else:
+#                   # (opcional) quitar duplicados y ordenar
+#                   idx_sp = np.unique(idx_sp)
+#                   sum_sp_distances_good = float(np.nansum(d[idx_sp]**2))
+#                   mean_sp_distances_good = float(np.nanmean(d[idx_sp]**2))
+#                   J_sp, G_sp, mse_sp = option1_score(d**2, selected_indices_good2_sp, sub_pts.shape[0])     
                   
               
-              print("-------------------------------- Superparaboloid ------------------------------")
-              print("good sp: ", selected_indices_good2_sp)
-              print("bad sp: ", selected_indices_bad2_sp)
-              print("remaining sp: ", remaining_indices2_sp)
+#               print("-------------------------------- Superparaboloid ------------------------------")
+#               print("good sp: ", selected_indices_good2_sp)
+#               print("bad sp: ", selected_indices_bad2_sp)
+#               print("remaining sp: ", remaining_indices2_sp)
               
-              fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-              mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-              showPoints(sub_pts[selected_indices_good2_sp], scale_factor=0.002, color=(1.0, 0.992, 0.157))
-              if selected_indices_bad2_sp.size >0:
-                  showPoints(sub_pts[selected_indices_bad2_sp], scale_factor=0.002, color=(0.224, 0.004, 0.278))
-              showPoints(sub_pts[remaining_indices2_sp], scale_factor=0.002, color=(0.243, 0.675, 0.647))
-              showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-              showTaperedSuperparaboloidWithBase(theta_np_sp, k_np_sp)
-              mlab.show()
+#               fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+#               mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
+#               showPoints(sub_pts[selected_indices_good2_sp], scale_factor=0.002, color=(1.0, 0.992, 0.157))
+#               if selected_indices_bad2_sp.size >0:
+#                   showPoints(sub_pts[selected_indices_bad2_sp], scale_factor=0.002, color=(0.224, 0.004, 0.278))
+#               showPoints(sub_pts[remaining_indices2_sp], scale_factor=0.002, color=(0.243, 0.675, 0.647))
+#               showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
+#               showTaperedSuperparaboloidWithBase(theta_np_sp, k_np_sp)
+#               mlab.show()
               
 
 
-              if J_sp<J_st:
-                  theta_np = theta_np_sp
-                  k_np = k_np_sp
-                  alpha_np = alpha_np_sp
-                  selected_indices_good2 = selected_indices_good2_sp
-                  remaining_indices2 = remaining_indices2_sp
-                  selected_indices_bad2 = selected_indices_bad2_sp
-                  free_space_penalty = free_space_penalty_sp
+#               if J_sp<J_st and selected_indices_good2_sp.size!=0:
+#                   theta_np = theta_np_sp
+#                   k_np = k_np_sp
+#                   alpha_np = alpha_np_sp
+#                   selected_indices_good2 = selected_indices_good2_sp
+#                   remaining_indices2 = remaining_indices2_sp
+#                   selected_indices_bad2 = selected_indices_bad2_sp
+#                   free_space_penalty = free_space_penalty_sp
               
-                  params["type"] = "superparaboloid"
-                  params["theta"] = theta_np
-                  params["k"] = k_np
-                  params["free_space_penalty"]=free_space_penalty
+#                   params["type"] = "superparaboloid"
+#                   params["theta"] = theta_np
+#                   params["k"] = k_np
+#                   params["free_space_penalty"]=free_space_penalty
                   
-                  loss_history = loss_history_sp
-                  loss_payload = {
-                      "scene": scene_,
-                      "test": int(test_n),
-                      "cluster_id": int(lid),
-                      "sub_id": int(sub_idx),
-                      "shape": "superparaboloid",
-                      "n_points": int(current_cluster.shape[0]),
-                      "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                      "history": loss_history,  # list[dict]
-                  }
-                  cluster_dir = out_dir / f"cluster{lid}"
-                  loss_file = cluster_dir / f"sub{sub_idx}_loss.yaml"
-                  _dump_yaml(loss_payload, loss_file)
-                  print("Saved loss history:", loss_file)
-                  sub_idx +=1
-              else:
-                  params["type"] = "supertoroid"
-                  params["theta"] = theta_np
-                  params["free_space_penalty"]=free_space_penalty
-                  loss_history = loss_history_st
-                  loss_payload = {
-                      "scene": scene_,
-                      "test": int(test_n),
-                      "cluster_id": int(lid),
-                      "sub_id": int(sub_idx),
-                      "shape": "supertoroid",
-                      "n_points": int(current_cluster.shape[0]),
-                      "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                      "history": loss_history,  # list[dict]
-                  }
-                  cluster_dir = out_dir / f"cluster{lid}"
-                  loss_file = cluster_dir / f"sub{sub_idx}_loss.yaml"
-                  _dump_yaml(loss_payload, loss_file)
-                  print("Saved loss history:", loss_file)
-                  sub_idx +=1
-              print("J supertoroid: ", J_st)
-              print("J superparaboloid: ", J_sp)
+#                   loss_history = loss_history_sp
+#                   loss_payload = {
+#                       "scene": scene_,
+#                       "test": int(test_n),
+#                       "cluster_id": int(lid),
+#                       "sub_id": int(sub_idx),
+#                       "shape": "superparaboloid",
+#                       "n_points": int(current_cluster.shape[0]),
+#                       "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+#                       "history": loss_history,  # list[dict]
+#                   }
+#                   cluster_dir = out_dir / f"cluster{lid}"
+#                   loss_file = cluster_dir / f"sub{sub_idx}_loss.yaml"
+#                   _dump_yaml(loss_payload, loss_file)
+#                   print("Saved loss history:", loss_file)
+#                   sub_idx +=1
+#               else:
+#                   params["type"] = "supertoroid"
+#                   params["theta"] = theta_np
+#                   params["free_space_penalty"]=free_space_penalty
+#                   loss_history = loss_history_st
+#                   loss_payload = {
+#                       "scene": scene_,
+#                       "test": int(test_n),
+#                       "cluster_id": int(lid),
+#                       "sub_id": int(sub_idx),
+#                       "shape": "supertoroid",
+#                       "n_points": int(current_cluster.shape[0]),
+#                       "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+#                       "history": loss_history,  # list[dict]
+#                   }
+#                   cluster_dir = out_dir / f"cluster{lid}"
+#                   loss_file = cluster_dir / f"sub{sub_idx}_loss.yaml"
+#                   _dump_yaml(loss_payload, loss_file)
+#                   print("Saved loss history:", loss_file)
+#                   sub_idx +=1
+#               print("J supertoroid: ", J_st)
+#               print("J superparaboloid: ", J_sp)
               
               
               
               
-              selected_indices_good2 = as_idx1d(selected_indices_good2)                           # indices relative to sub_pts
-              selected_indices_bad2  = as_idx1d(selected_indices_bad2)
-              remaining_indices2  = as_idx1d(remaining_indices2)
+#               selected_indices_good2 = as_idx1d(selected_indices_good2)                           # indices relative to sub_pts
+#               selected_indices_bad2  = as_idx1d(selected_indices_bad2)
+#               remaining_indices2  = as_idx1d(remaining_indices2)
 
-              # Map back to original current_cluster:
-              selected_indices_good_p = used_indices[selected_indices_good2]
-              selected_indices_bad_p  = used_indices[selected_indices_bad2]
-              remaining_indices_p  = used_indices[remaining_indices2]
+#               # Map back to original current_cluster:
+#               selected_indices_good_p = used_indices[selected_indices_good2]
+#               selected_indices_bad_p  = used_indices[selected_indices_bad2]
+#               remaining_indices_p  = used_indices[remaining_indices2]
               
-              if good1.size == 0:
-                  remaining_indices = remaining_indices_p
-                  selected_indices_bad = selected_indices_bad2
-              else:
-                  remaining_indices =  remaining_indices_p
-                  selected_indices_bad = np.union1d(selected_indices_bad, selected_indices_bad_p)
-              print("remaining_indices: ", remaining_indices)
-              print("selected_indices_bad: ", selected_indices_bad)
-          else: # superellipsoid
-            loss_history = loss_history_se
-            loss_payload = {
-                "scene": scene_,
-                "test": int(test_n),
-                "cluster_id": int(lid),
-                "sub_id": int(sub_idx),
-                "shape": "superquadric",
-                "n_points": int(current_cluster.shape[0]),
-                "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                "history": loss_history,  # list[dict]
-            }
-            cluster_dir = out_dir / f"cluster{lid}"
-            loss_file = cluster_dir / f"sub{sub_idx}_loss.yaml"
-            _dump_yaml(loss_payload, loss_file)
-            print("Saved loss history:", loss_file)
-            sub_idx +=1
+#               if good1.size == 0:
+#                   remaining_indices = remaining_indices_p
+#                   selected_indices_bad = selected_indices_bad2
+#               else:
+#                   remaining_indices =  remaining_indices_p
+#                   selected_indices_bad = np.union1d(selected_indices_bad, selected_indices_bad_p)
+#               print("remaining_indices: ", remaining_indices)
+#               print("selected_indices_bad: ", selected_indices_bad)
+#           else: # superellipsoid
+#             loss_history = loss_history_se
+#             loss_payload = {
+#                 "scene": scene_,
+#                 "test": int(test_n),
+#                 "cluster_id": int(lid),
+#                 "sub_id": int(sub_idx),
+#                 "shape": "superquadric",
+#                 "n_points": int(current_cluster.shape[0]),
+#                 "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+#                 "history": loss_history,  # list[dict]
+#             }
+#             cluster_dir = out_dir / f"cluster{lid}"
+#             loss_file = cluster_dir / f"sub{sub_idx}_loss.yaml"
+#             _dump_yaml(loss_payload, loss_file)
+#             print("Saved loss history:", loss_file)
+#             sub_idx +=1
 
       
-        # if selected_indices_good.size == 0 and selected_indices_good2.size == 0 and selected_indices_good2_sp.size==0:
-        #     continue
-        next_indices = np.union1d(remaining_indices, selected_indices_bad)
-        residual = current_cluster[next_indices]
+#         # if selected_indices_good.size == 0 and selected_indices_good2.size == 0 and selected_indices_good2_sp.size==0:
+#         #     continue
+#         next_indices = np.union1d(remaining_indices, selected_indices_bad)
+#         residual = current_cluster[next_indices]
         
-        fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-        mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-        showPoints(residual, scale_factor=0.0025, color=(0.894, 0.447, 0.0))
-        showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-        mlab.show()
-        print(next_indices.shape)
-        # mlab.show()
-        # ---- NEW: subcluster residual and enqueue ----
-        subclusters = split_by_distance(residual, eps=1e-2, min_samples=5)
+#         fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+#         mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
+#         showPoints(residual, scale_factor=0.0025, color=(0.894, 0.447, 0.0))
+#         showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
+#         mlab.show()
+#         print(next_indices.shape)
+#         # mlab.show()
+#         # ---- NEW: subcluster residual and enqueue ----
+#         subclusters = split_by_distance(residual, eps=1e-2, min_samples=5)
         
-        print("subclusters: ", len(subclusters))
-        for sub in subclusters:
-            if sub.shape[0] > 30:
-                queue.append(sub)
+#         print("subclusters: ", len(subclusters))
+#         for sub in subclusters:
+#             if sub.shape[0] > 10:
+#                 queue.append(sub)
 
-#       showTaperedSuperparaboloidWithBase(params['theta'], params['k'])
-# showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
+# #       showTaperedSuperparaboloidWithBase(params['theta'], params['k'])
+# # showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
+# # mlab.show()
+
+
+# # --- group modeled shapes by cluster from all_params_modeled and dump YAML
+# by_cluster = defaultdict(list)
+# for _i, p in all_params_modeled.items():
+#     lid = int(p["cluster"])
+#     by_cluster[lid].append({
+#         "type": p["type"],
+#         "theta": _to_py(p.get("theta")),
+#         "k": _to_py(p.get("k")),
+#         "b": _to_py(p.get("b")),
+#         "alpha": _to_py(p.get("alpha")),
+#         "free_space_penalty": _to_py(p.get("free_space_penalty")),
+#         "indices_good": _flow_list(p.get("indices_good")),
+#         "indices_bad": _flow_list(p.get("indices_bad")),
+#         "indices_remaining": _flow_list(p.get("indices_remaining")),
+#     })                
+
+
+# for lid, shapes in by_cluster.items():
+#     payload = {
+#         "scene": scene_,
+#         "test": int(test_n),
+#         "cluster_id": int(lid),
+#         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+#         "n_shapes": len(shapes),
+#         "shapes": shapes,
+#     }
+#     out_file = out_dir / f"cluster{lid}.yaml"
+#     out_file.write_text("# ############## CLUSTER RESULTS ##############\n" + _dump(payload))
+#     print("Saved", out_file)
+
+# import sys
+
+# def print_camera_view(fig):
+#     az, el, dist, fp = mlab.view(figure=fig)
+#     roll = mlab.roll(figure=fig)
+#     print(f"Azimuth: {az:.2f}  Elevation: {el:.2f}  Distance: {dist:.4f}")
+#     print(f"Focal Point: {tuple(fp)}")
+#     print(f"Roll: {roll:.2f}")
+#     print("-"*50)
+#     sys.stdout.flush()
+
+# # --- fire on interaction (drag/zoom/rotate) ---
+# def _on_interaction(obj, evt):
+#     print_camera_view(fig)
+
+# def _on_end_interaction(obj, evt):
+#     print_camera_view(fig)
+
+
+# print(all_params_modeled)
+
+# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
+# # mlab.figure(fig)  # make it current
+# # fig.scene.interactor.add_observer("InteractionEvent", _on_interaction)
+# # Print on every camera move (use 'EndInteractionEvent' to print only when the user releases)
+# # fig.scene.interactor.add_observer('InteractionEvent', on_interaction)
+
+# mlab.view(azimuth=108.51, elevation=168.97, distance=0.5805, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.864720847838999), roll=-177.93)
+# for idx,params in all_params_modeled.items():
+#     if params["type"] == "superquadric":
+#       showSuperquadrics(params['theta'], params["b"], params["alpha"])
+#     elif params["type"] == "supertoroid":
+#       showSupertoroid(params['theta'])
+#     else:
+#       showTaperedSuperparaboloidWithBase(params["theta"], params["k"])
+# showPoints(point_cloud, scale_factor=0.0025, color=(0.702, 0.702, 0.702), figure=fig)
+# print_camera_view(fig)
+
 # mlab.show()
 
 
-# --- group modeled shapes by cluster from all_params_modeled and dump YAML
-by_cluster = defaultdict(list)
-for _i, p in all_params_modeled.items():
-    lid = int(p["cluster"])
-    by_cluster[lid].append({
-        "type": p["type"],
-        "theta": _to_py(p.get("theta")),
-        "k": _to_py(p.get("k")),
-        "b": _to_py(p.get("b")),
-        "alpha": _to_py(p.get("alpha")),
-        "free_space_penalty": _to_py(p.get("free_space_penalty")),
-        "indices_good": _flow_list(p.get("indices_good")),
-        "indices_bad": _flow_list(p.get("indices_bad")),
-        "indices_remaining": _flow_list(p.get("indices_remaining")),
-    })
-
-for lid, shapes in by_cluster.items():
-    payload = {
-        "scene": scene_,
-        "test": int(test_n),
-        "cluster_id": int(lid),
-        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-        "n_shapes": len(shapes),
-        "shapes": shapes,
-    }
-    out_file = out_dir / f"cluster{lid}.yaml"
-    out_file.write_text("# ############## CLUSTER RESULTS ##############\n" + _dump(payload))
-    print("Saved", out_file)
-
-import sys
-
-def print_camera_view(fig):
-    az, el, dist, fp = mlab.view(figure=fig)
-    roll = mlab.roll(figure=fig)
-    print(f"Azimuth: {az:.2f}  Elevation: {el:.2f}  Distance: {dist:.4f}")
-    print(f"Focal Point: {tuple(fp)}")
-    print(f"Roll: {roll:.2f}")
-    print("-"*50)
-    sys.stdout.flush()
-
-# --- fire on interaction (drag/zoom/rotate) ---
-def _on_interaction(obj, evt):
-    print_camera_view(fig)
-
-def _on_end_interaction(obj, evt):
-    print_camera_view(fig)
-
-
-print(all_params_modeled)
-
-fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-# mlab.figure(fig)  # make it current
-# fig.scene.interactor.add_observer("InteractionEvent", _on_interaction)
-# Print on every camera move (use 'EndInteractionEvent' to print only when the user releases)
-# fig.scene.interactor.add_observer('InteractionEvent', on_interaction)
-
-mlab.view(azimuth=108.51, elevation=168.97, distance=0.5805, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.864720847838999), roll=-177.93)
-for idx,params in all_params_modeled.items():
-    if params["type"] == "superquadric":
-      showSuperquadrics(params['theta'], params["b"], params["alpha"])
-    elif params["type"] == "supertoroid":
-      showSupertoroid(params['theta'])
-    else:
-      showTaperedSuperparaboloidWithBase(params["theta"], params["k"])
-showPoints(point_cloud, scale_factor=0.0025, color=(0.702, 0.702, 0.702), figure=fig)
-print_camera_view(fig)
-
-mlab.show()
-
-
+alpha = 0.0
