@@ -827,7 +827,11 @@ def remove_largest_plane(points_np, distance_threshold=0.01, ransac_n=3, num_ite
 #     R = Rz @ Ry @ Rx
 #     return R
 def build_rotation_matrix(euler):
-    rz, ry, rx = euler
+    # rz, ry, rx = euler
+    rz = euler[0]
+    ry = euler[1]
+    rx = euler[2]
+    
     cz, sz = torch.cos(rz), torch.sin(rz)
     cy, sy = torch.cos(ry), torch.sin(ry)
     cx, sx = torch.cos(rx), torch.sin(rx)
@@ -2516,7 +2520,8 @@ def inlier_mass_prior(p, target_ratio=0.2, weight=1.0):
     m = p.mean()
     return weight * F.relu(target_ratio - m)**2
 
-def compute_p_from_dist(distances, sigma2, p0, w=0.1):
+# def compute_p_from_dist(distances, sigma2, p0, w=0.1):
+def compute_p_from_dist(distances: torch.Tensor, sigma2: torch.Tensor, p0: torch.Tensor, w: float = 0.1):
     """
     Compute point responsibilities (E-step).
     distances: (N,) tensor
@@ -2567,10 +2572,16 @@ def sq_F(points, theta):
 
 
 
-def table_transverse_loss(table_pts, theta, tol=0.005, reduction="mean"):
+def table_transverse_loss(table_pts, theta, tol=0.005, reduction="mean", max_dist=None):
     # print("table transverse loss")
     # print("table_pts:", tuple(table_pts.shape))
-
+    if max_dist is not None:
+        with torch.no_grad():
+            center = theta[8:11]
+            dists = (table_pts - center).norm(dim=1)
+            near_mask = dists < max_dist
+        table_pts = table_pts[near_mask]
+        
     if table_pts.numel() == 0:
         return torch.tensor(0.0, device=theta.device)
 
@@ -2939,8 +2950,8 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
         plane_normal=plane_normal,
         plane_d=torch.tensor(float(d), device=theta.device),
         half_size=1.0,      # ±1 m in both in-plane directions
-        step=0.01,          # 2 cm spacing; adjust as you like
-        offset_above=0.01,    # or e.g. 0.005 to sit 5 mm above the plane
+        step=0.02,          # 2 cm spacing; adjust as you like
+        offset_above=0.0,    # or e.g. 0.005 to sit 5 mm above the plane
     )
     
     
@@ -3052,7 +3063,8 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
     print(f"[initialization] elapsed: {elapsed:.3f} s")
     
     raw_log = []
-      
+    sq_distances_scripted = torch.jit.script(sq_distances)
+    compute_p_from_dist_scripted = torch.jit.script(compute_p_from_dist)
     if shape == 'superquadric':
       
         optimizer = torch.optim.Adam([theta], lr=lr, weight_decay=weight_decay)
@@ -3079,7 +3091,8 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                 optimizer.zero_grad(set_to_none=True)
                 # torch.cuda.synchronize()
                 # t_d0 = time.perf_counter()
-                d = sq_distances(points_centered, theta)  # shape (N,)
+                #d = sq_distances(points_centered, theta)  # shape (N,)
+                d = sq_distances_scripted(points_centered, theta)  # shape (N,)
                 # torch.cuda.synchronize()
                 # elapsed = time.perf_counter() - t_d0
                 # print(f"[sq_distances] elapsed: {elapsed:.4f} s")
@@ -3088,7 +3101,9 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                 with torch.no_grad():
                     # torch.cuda.synchronize()
                     # t_p0 = time.perf_counter()
-                    p,const = compute_p_from_dist(d, sigma2, p0, w)
+                    # p,const = compute_p_from_dist(d, sigma2, p0, w)
+                    p,const = compute_p_from_dist_scripted(d, sigma2, p0, w)
+
                     #p = p.clamp_(1e-6, 1-1e-6)  # same as your old behavior
                     # torch.cuda.synchronize()
                     # elapsed = time.perf_counter() - t_p0
@@ -3141,7 +3156,8 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
 
                     # torch.cuda.synchronize()
                     # t_table0 = time.perf_counter()
-                    table_loss = table_transverse_loss(table_pts, theta)
+                    max_radius = 3.0 * torch.max(theta[2:5]).item()
+                    table_loss = table_transverse_loss(table_pts, theta, max_dist=max_radius)
                     # torch.cuda.synchronize()
                     # elapsed = time.perf_counter() - t_table0
                     # print(f"[table_transverse_loss] elapsed: {elapsed:.5f} s")
@@ -3323,7 +3339,9 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
         k_np = 0
         free_space_penalty1 = 0
         
-        distances_final = sq_distances(points_centered, theta).detach().cpu().numpy()
+        # distances_final = sq_distances(points_centered, theta).detach().cpu().numpy()
+        distances_final = sq_distances_scripted(points_centered, theta).detach().cpu().numpy()
+
         if selected_indices_good.size>0:
             # Now sample along these rays
             number_samples_per_ray1 = 200

@@ -28,7 +28,7 @@ lambda_free_supertoroid_ = 30.0
 lambda_transverse_table_supertoroid_ = 10.0
 
 T_superparaboloid_ = 2000
-number_samples_per_ray_ = 300
+number_samples_per_ray_ = 200
 weight_decay_ = 0.01
 
 params = {
@@ -159,7 +159,7 @@ camera_origin = torch.zeros_like(all_points)  # shape (N, 3), all (0,0,0)
 directions = all_points - camera_origin  # or just points if origin is (0,0,0)
 
 # Now sample along these rays
-number_samples_per_ray = 120
+number_samples_per_ray = 150
 number_of_rays = all_points.shape[0]
 
 t_vals = torch.linspace(0.03, 1.1, number_samples_per_ray, device=all_points.device)  # go slightly past the surface
