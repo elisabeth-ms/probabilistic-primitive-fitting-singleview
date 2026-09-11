@@ -792,40 +792,6 @@ def remove_largest_plane(points_np, distance_threshold=0.01, ransac_n=3, num_ite
 
     return remaining_points, plane_points, plane_model
 
-
-# def build_rotation_matrix(euler_angles):
-#     rz, ry, rx = euler_angles
-
-#     cosx = torch.cos(rx)
-#     sinx = torch.sin(rx)
-#     cosy = torch.cos(ry)
-#     siny = torch.sin(ry)
-#     cosz = torch.cos(rz)
-#     sinz = torch.sin(rz)
-
-#     # Rotation around x-axis
-#     Rx = torch.stack([
-#         torch.stack([torch.tensor(1., device=euler_angles.device), torch.tensor(0., device=euler_angles.device), torch.tensor(0., device=euler_angles.device)]),
-#         torch.stack([torch.tensor(0., device=euler_angles.device), cosx, -sinx]),
-#         torch.stack([torch.tensor(0., device=euler_angles.device), sinx,  cosx])
-#     ])
-
-#     # Rotation around y-axis
-#     Ry = torch.stack([
-#         torch.stack([cosy, torch.tensor(0., device=euler_angles.device), siny]),
-#         torch.stack([torch.tensor(0., device=euler_angles.device), torch.tensor(1., device=euler_angles.device), torch.tensor(0., device=euler_angles.device)]),
-#         torch.stack([-siny, torch.tensor(0., device=euler_angles.device), cosy])
-#     ])
-
-#     # Rotation around z-axis
-#     Rz = torch.stack([
-#         torch.stack([cosz, -sinz, torch.tensor(0., device=euler_angles.device)]),
-#         torch.stack([sinz,  cosz, torch.tensor(0., device=euler_angles.device)]),
-#         torch.stack([torch.tensor(0., device=euler_angles.device), torch.tensor(0., device=euler_angles.device), torch.tensor(1., device=euler_angles.device)])
-#     ])
-
-#     R = Rz @ Ry @ Rx
-#     return R
 def build_rotation_matrix(euler):
     # rz, ry, rx = euler
     rz = euler[0]
@@ -1391,6 +1357,56 @@ def sq_inside_near_only(points, theta, b, alpha, far_const=20.0):
     F[idx] = term1 + term2
     
     return F
+
+def sq_inside_near_only_graph_safe(points, theta, b, alpha, factor=1.5, pad=0.2, far_const=20.0):
+    # near mask, computed with detached theta (selection carries no gradient) — fixed shape, no nonzero
+    th = theta.detach()
+    R_d = build_rotation_matrix(th[5:8])
+    t_d = th[8:11]
+    pts_local_d = points @ R_d - t_d @ R_d
+
+    a1_d = th[2].abs().clamp_min(1e-6)
+    a2_d = th[3].abs().clamp_min(1e-6)
+    a3_d = th[4].abs().clamp_min(1e-6)
+
+    xq = pts_local_d[:, 0] / a1_d
+    yq = pts_local_d[:, 1] / a2_d
+    zq = pts_local_d[:, 2] / a3_d
+    q = xq*xq + yq*yq + zq*zq
+    thr = (factor + pad) ** 2
+    near_mask = q <= thr   # (N,) bool, fixed size — no nonzero
+
+    # evaluate the superquadric function over ALL points, differentiable w.r.t. theta
+    e1, e2 = theta[0], theta[1]
+    a1 = theta[2].abs().clamp_min(1e-6)
+    a2 = theta[3].abs().clamp_min(1e-6)
+    a3 = theta[4].abs().clamp_min(1e-6)
+    R  = build_rotation_matrix(theta[5:8])
+    t  = theta[8:11]
+
+    pl = points @ R - t @ R
+
+    if b is not None and alpha is not None:
+        pl = unbend_points_torch(pl, b, alpha)
+
+    x_ = pl[:, 0] / a1
+    y_ = pl[:, 1] / a2
+    z_ = pl[:, 2] / a3
+
+    def spow(u, p, eps=1e-8, umax=1e2, max_log=100.0):
+        u = torch.clamp(u.abs(), min=eps, max=umax)
+        return torch.exp(torch.clamp(p * torch.log(u), -max_log, max_log))
+
+    px = spow(x_, 2.0 / e2)
+    py = spow(y_, 2.0 / e2)
+    s  = torch.clamp(px + py, min=1e-8)
+    term1 = torch.exp(torch.clamp((e2 / e1) * torch.log(s), -1000.0, 1000.0))
+    term2 = spow(z_, 2.0 / e1)
+    F_all = term1 + term2
+
+    far = torch.full_like(F_all, float(far_const))
+    F = torch.where(near_mask, F_all, far)   # fixed shape always
+    return F
   
 def _active_idx(points, theta, factor=50.0, pad=0.3):
     # máscara dinámica por iteración, usando θ detached (la selección no mete gradiente)
@@ -1793,91 +1809,6 @@ def prune_clusters_like(clusters: Dict[int, np.ndarray],
         report[lab] = {"orig": orig, "kept": kept, "dropped": orig - kept}
     return cleaned, report
 
-
-
-
-
-def fit_multiple_shape_to_clusters(clusters_points_np, label="root", depth=0, max_depth=3):
-  n_clusters = len(clusters_points_np)
-  n_steps = 300
-
-  # Store everything in lists
-  thetas = []
-  optimizers = []
-  sigma2s = []
-  p0s = []
-  losses_per_step = [[] for _ in range(n_clusters)]
-  points_centered_list = []
-  t0s = []
-  losses = []
-
-  # Initialize all
-  for cluster_np in clusters_points_np:
-      points = torch.tensor(cluster_np, dtype=torch.float32, device='cuda')
-      points_centered, theta, _, p0, sigma2, t0 = initialize_theta_pytorch(points, False)
-      
-      ray_samples = ray_samples_flat - t0
-      
-      thetas.append(theta)
-      optimizers.append(torch.optim.Adam([theta], lr=1e-3))
-      sigma2s.append(sigma2)
-      p0s.append(p0)
-      points_centered_list.append(points_centered)
-      t0s.append(t0)
-      losses.append(None)  # Placeholder for losses per cluster
-
-  # Now interleave the optimization:
-  for step in range(n_steps):
-      # 1. Zero all grads first
-      for opt in optimizers:
-          opt.zero_grad()
-
-      # 2. Compute all losses and backward passes
-      for i in range(n_clusters):
-          theta = thetas[i]
-          points_centered = points_centered_list[i]
-          p0 = p0s[i]
-          sigma2 = sigma2s[i]
-          ray_samples = ray_samples_flat - t0s[i]
-
-          loss, p, distances = superquadric_total_loss(
-              points_centered, theta, p0, 0.0, sigma2,
-              number_of_rays, number_samples_per_ray, ray_samples
-          )
-          losses[i] = (loss, p, distances)
-          loss.backward(retain_graph=True)
-          losses_per_step[i].append(loss.item())
-
-      # 3. Step all optimizers
-      for opt in optimizers:
-          opt.step()
-
-      # 4. Update sigma and clamp theta
-      for i in range(n_clusters):
-          theta = thetas[i]
-          loss, p, distances = losses[i]
-
-          with torch.no_grad():
-              if step % 10 == 0:
-                  sigma2_new = 2 * torch.sum(p * distances ** 2) / (3 * torch.sum(p) + 1e-8)
-                  sigma2s[i] = 0.8 * sigma2s[i] + 0.2 * sigma2_new
-
-              theta[0].clamp_(0.001, 2.0)
-              theta[1].clamp_(0.001, 2.0)
-              theta[2:5].clamp_(0.001, 2.0)
-              theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
-
-      if step % 50 == 0:
-          print(f"Global step {step}: {[l[0].item() for l in losses]}")
-  translated_thetas = []
-  for i, theta in enumerate(thetas):
-      theta = theta.clone()  # (optional if you're not sure)
-      theta[8:11] = theta[8:11] + t0s[i]
-      translated_thetas.append(theta)
-  return translated_thetas
-
-import torch
-import math
 
 # --- muestreo de la superficie del superparaboloide con base "tapered" por k ---
 def sample_tapered_spb_surface(theta, k, n_z=100, n_omega=200):
@@ -2520,27 +2451,33 @@ def inlier_mass_prior(p, target_ratio=0.2, weight=1.0):
     m = p.mean()
     return weight * F.relu(target_ratio - m)**2
 
-# def compute_p_from_dist(distances, sigma2, p0, w=0.1):
-def compute_p_from_dist(distances: torch.Tensor, sigma2: torch.Tensor, p0: torch.Tensor, w: float = 0.1):
-    """
-    Compute point responsibilities (E-step).
-    distances: (N,) tensor
-    sigma2: variance
-    p0: uniform outlier prob ~ 1/Volume
-    w: mixing weight
-    """
+# # def compute_p_from_dist(distances, sigma2, p0, w=0.1):
+# def compute_p_from_dist(distances: torch.Tensor, sigma2: torch.Tensor, p0: torch.Tensor, w: float = 0.1):
+#     """
+#     Compute point responsibilities (E-step).
+#     distances: (N,) tensor
+#     sigma2: variance
+#     p0: uniform outlier prob ~ 1/Volume
+#     w: mixing weight
+#     """
 
+#     c = (2 * torch.pi * sigma2) ** (- 3 / 2)
+#     const = (w * p0) / (c * (1 - w))
+
+#     dist_term = torch.exp(-1 / (2 * sigma2) * distances ** 2)
+#     p = dist_term / (const + dist_term)
+#     return torch.clamp(p, min=1e-3), const
+
+def compute_p_from_dist(distances: torch.Tensor, sigma2: torch.Tensor, p0: torch.Tensor, w: torch.Tensor):
     c = (2 * torch.pi * sigma2) ** (- 3 / 2)
     const = (w * p0) / (c * (1 - w))
-
     dist_term = torch.exp(-1 / (2 * sigma2) * distances ** 2)
     p = dist_term / (const + dist_term)
     return torch.clamp(p, min=1e-3), const
 
-
-
 def free_space_loss(ray_samples_flat, theta, b, alpha, number_of_rays, sharpness=20.0, hinge_weight=1.0):
-    inside_score = sq_inside_near_only(ray_samples_flat, theta, b, alpha)
+    #inside_score = sq_inside_near_only(ray_samples_flat, theta, b, alpha)
+    inside_score = sq_inside_near_only_graph_safe(ray_samples_flat, theta, b, alpha)
     soft_inside = torch.sigmoid(-(inside_score - 1.0) * sharpness)
     
     violation = torch.relu(1.0 - inside_score)   # 0 on/outside, grows linearly deeper inside
@@ -2581,7 +2518,6 @@ def table_transverse_loss(table_pts, theta, tol=0.005, reduction="mean", max_dis
             dists = (table_pts - center).norm(dim=1)
             near_mask = dists < max_dist
         table_pts = table_pts[near_mask]
-        
     if table_pts.numel() == 0:
         return torch.tensor(0.0, device=theta.device)
 
@@ -2612,6 +2548,28 @@ def table_transverse_loss(table_pts, theta, tol=0.005, reduction="mean", max_dis
         return vals.sum()
     else:
         raise ValueError("reduction must be 'mean'|'max'|'sum'")
+
+def table_transverse_loss_graph_safe(table_pts, theta, tol=0.005, reduction="mean"):
+    # F == 1 on the surface, < 1 inside the shape, > 1 outside
+    F = sq_F(table_pts, theta)
+    inside = F < (1.0 - tol)
+
+    # penetration amount in F-space
+    penetration = (1.0 - F)
+
+    # keep tensor shape fixed: zero out contributions from non-penetrating points
+    # instead of filtering (which would change shape and break CUDA graph capture)
+    vals = torch.where(inside, penetration, torch.zeros_like(penetration))
+
+    # avoid division by zero without a data-dependent branch
+    count = inside.sum().clamp_min(1)
+
+    if reduction == "mean":
+        return vals.sum() / count
+    elif reduction == "sum":
+        return vals.sum()
+    else:
+        raise ValueError("reduction must be 'mean' or 'sum' for this version")
 
 def _plane_project_point(p, n, d):
     """
@@ -2897,7 +2855,55 @@ def _dump_yaml(obj, path: Path):
     with open(path, "w") as f:
         yaml.safe_dump(obj, f, sort_keys=False, allow_unicode=True)
 
+# def superquadric_step(points_centered, theta, sigma2, p0, w,
+#                        ray_samples_flat, n_rays,
+#                        table_pts,
+#                        b, alpha,
+#                        lambda_free, lambda_transverse_table,
+#                        sigma_momentum):
+#     d = sq_distances(points_centered, theta)
+#     with torch.no_grad():
+#         p, const = compute_p_from_dist(d, sigma2, p0, w)
+#     fit = torch.sum(p * d**2)
 
+#     free = free_space_loss(ray_samples_flat, theta, b, alpha, n_rays)
+
+#     table_loss = table_transverse_loss_graph_safe(table_pts, theta)
+
+#     loss = fit + lambda_free * free + lambda_transverse_table * table_loss
+
+#     with torch.no_grad():
+#         sigma2_new = 2 * torch.sum(p * d**2) / (3 * torch.sum(p) + 1e-8)
+#         # write in-place into the same buffer instead of returning a new tensor,
+#         # so the same memory address is reused across CUDA Graph replays
+#         sigma2.copy_(sigma_momentum * sigma2 + (1.0 - sigma_momentum) * sigma2_new)
+
+#     return loss, d, p, fit, free, table_loss
+
+def superquadric_step(points_centered, theta, sigma2, p0, w,
+                       ray_samples_flat, n_rays,
+                       table_pts,
+                       b, alpha,
+                       lambda_free, lambda_transverse_table,
+                       sigma_momentum, sigma_update_mask):
+    d = sq_distances(points_centered, theta)
+    with torch.no_grad():
+        p, const = compute_p_from_dist(d, sigma2, p0, w)
+    fit = torch.sum(p * d**2)
+
+    free = free_space_loss(ray_samples_flat, theta, b, alpha, n_rays)
+    table_loss = table_transverse_loss_graph_safe(table_pts, theta)
+
+    loss = fit + lambda_free * free + lambda_transverse_table * table_loss
+
+    with torch.no_grad():
+        sigma2_new = 2 * torch.sum(p * d**2) / (3 * torch.sum(p) + 1e-8)
+        candidate = sigma_momentum * sigma2 + (1.0 - sigma_momentum) * sigma2_new
+        # only actually update sigma2 when sigma_update_mask == 1.0 (every sigma_every steps),
+        # otherwise keep it unchanged — same semantics as the original `if outer % sigma_every`
+        sigma2.copy_(sigma_update_mask * candidate + (1.0 - sigma_update_mask) * sigma2)
+
+    return loss, d, p, fit, free, table_loss
 
 def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=None, plane_model = None, N_ref=None,
                          all_points = None, number_samples_per_ray=None, base_lr=None, T=None, K=None, sigma_momentum=None, sigma_every=None,
@@ -2906,9 +2912,7 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                          T_superparaboloid=None, table_normal=None, weight_decay=None):
     print("N_ref:",N_ref)
     lr, weight_decay = lr_wd_from_N(cluster_points_np.size,N_ref=N_ref, lr_ref=0.01)
-    # --- START TIMER ---
-    torch.cuda.synchronize()
-    t0_time = time.perf_counter()
+
     
     # loss_per_iteration = []
     
@@ -3017,27 +3021,22 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
 
     R = directions.shape[0]
     chunk = min(512, R)  # rays per step
-    g = torch.Generator(device=directions.device).manual_seed(0)  # optional determinism
-    perm = torch.randperm(R, generator=g, device=directions.device)
     n_chunks = (R + chunk - 1) // chunk
-
-
-    # # Precompute once
-    # S = 300  # try 64–128 instead of 300
-    # t_vals = torch.linspace(0.7, 0.99, S, device=points_in_cone.device)
-    # R = points_in_cone.shape[0]          # = 30044
-    # perm = torch.randperm(R, device=points_in_cone.device)
-    # chunk = 8000                          # rays per step (2k–8k are common)
-    # n_chunks = (R + chunk - 1) // chunk
-
-    # print(current_ray_samples_flat)
-
-    # current_ray_samples_flat = ray_samples_flat - t0
+    R_padded = n_chunks * chunk  
     
-    # sigma2 = torch.nn.Parameter(sigma2)
+    g_rand = torch.Generator(device=directions.device).manual_seed(0)  # optional determinism
+    perm = torch.randperm(R, generator=g_rand, device=directions.device)
+
+    if R_padded > R:
+        pad = perm[:R_padded - R]
+        perm = torch.cat([perm, pad], dim=0)
+
     iter_sigma = 0
 
     table_pts = points_in_cone_table_pts - t0
+    
+    
+    
     N_ref = N_ref
     N_cluster = cluster_points_np.shape[0]
     
@@ -3049,25 +3048,27 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
     w = w0
     theta_prev = None
     
-    
 
-    # justo antes de devolver / terminar:
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - t0_time
+    
+    # # justo antes de devolver / terminar:
+    # torch.cuda.synchronize()
+    # elapsed = time.perf_counter() - t0_time
     
     loss_history = []   
     run_id = str(uuid.uuid4())[:8]
     free_cached = torch.zeros((), device=theta.device)  # scalar tensor
     table_cached = torch.zeros((), device=theta.device)  # scalar tensor
 
-    print(f"[initialization] elapsed: {elapsed:.3f} s")
     
     raw_log = []
-    sq_distances_scripted = torch.jit.script(sq_distances)
-    compute_p_from_dist_scripted = torch.jit.script(compute_p_from_dist)
+
+    
+    # --- START TIMER ---
+    torch.cuda.synchronize()
+    t0_time = time.perf_counter()
     if shape == 'superquadric':
       
-        optimizer = torch.optim.Adam([theta], lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.Adam([theta], lr=lr, weight_decay=weight_decay, capturable=True)
 
         prev_loss = None
         free_step = 0
@@ -3077,203 +3078,127 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
         patience_limit = 10      # nº de checks consecutivos sin mejora antes de parar
         check_every = 100        # cada cuántas iteraciones comprobamos convergencia
         min_iters = 500           # no permitir parar antes de esto, para dar margen al warm-up de w0->w_final
-        
-        for outer in range(T):
-            if outer % freeze_every == 0:
-                print("One e-step multiple M-steps")
 
-            else:
-                # --- soft-EM normal (un step) ---
-                t = outer/float(T-1)
-                s = max(0.0, (t-ramp_start)/(1-ramp_start))
-                w = (1.0-s)*w0+s*w_final
-                
+
+        # reuse a realistic table_pts and theta from an actual run
+        # torch.cuda.synchronize()
+        # t0 = time.perf_counter()
+        # for _ in range(1000):
+        #     old = table_transverse_loss(table_pts, theta)
+        # torch.cuda.synchronize()
+        # print("old:", time.perf_counter() - t0)
+
+        # torch.cuda.synchronize()
+        # t0 = time.perf_counter()
+        # for _ in range(1000):
+        #     new = table_transverse_loss_graph_safe(table_pts, theta)
+        # torch.cuda.synchronize()
+        # print("new:", time.perf_counter() - t0)
+        
+        
+        # --- static buffers for CUDA Graph capture (ya los tienes) ---
+        static_sigma2 = sigma2.detach().clone()
+        static_w = torch.tensor(w0, device=theta.device, dtype=theta.dtype)
+        static_ray_samples = torch.empty(chunk * S, 3, device=theta.device, dtype=theta.dtype)
+        static_sigma_update_mask = torch.tensor(1.0, device=theta.device, dtype=theta.dtype)
+        
+        # --- helper to fill the static buffers for a given outer index ---
+        def _fill_static_buffers(outer_idx, free_step_val, perm_current):
+            t_ = outer_idx / float(T - 1)
+            s_ = max(0.0, (t_ - ramp_start) / (1 - ramp_start))
+            w_value = (1.0 - s_) * w0 + s_ * w_final
+            static_w.copy_(torch.tensor(w_value, device=theta.device, dtype=theta.dtype))
+
+            update_now = 1.0 if (outer_idx % sigma_every) == 0 else 0.0
+            if outer_idx < 20:   # solo las primeras iteraciones, para no llenar la consola
+                print(f"outer={outer_idx}, sigma_every={sigma_every}, update_now={update_now}")
+            static_sigma_update_mask.copy_(torch.tensor(update_now, device=theta.device, dtype=theta.dtype))
+
+            step_mod = free_step_val % n_chunks
+            ray_ids = perm_current[step_mod*chunk : (step_mod+1)*chunk]
+            dirs = directions[ray_ids]
+            orig = camera_origin[ray_ids]
+            ray_pts = orig[:, None, :] + t_vals[None, :, None] * dirs[:, None, :]
+            static_ray_samples.copy_(ray_pts.reshape(-1, 3) - t0)
+
+        # --- WARM-UP (runs a few real steps in a side stream, NOT captured) ---
+        free_step = 0
+        _fill_static_buffers(1, free_step, perm)  # use outer=1 so we don't hit the freeze_every==0 branch
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(5):
                 optimizer.zero_grad(set_to_none=True)
-                # torch.cuda.synchronize()
-                # t_d0 = time.perf_counter()
-                #d = sq_distances(points_centered, theta)  # shape (N,)
-                d = sq_distances_scripted(points_centered, theta)  # shape (N,)
-                # torch.cuda.synchronize()
-                # elapsed = time.perf_counter() - t_d0
-                # print(f"[sq_distances] elapsed: {elapsed:.4f} s")
-
-                # responsibilities from current θ, but no grad through p
-                with torch.no_grad():
-                    # torch.cuda.synchronize()
-                    # t_p0 = time.perf_counter()
-                    # p,const = compute_p_from_dist(d, sigma2, p0, w)
-                    p,const = compute_p_from_dist_scripted(d, sigma2, p0, w)
-
-                    #p = p.clamp_(1e-6, 1-1e-6)  # same as your old behavior
-                    # torch.cuda.synchronize()
-                    # elapsed = time.perf_counter() - t_p0
-                    # print(f"[sq_probabilities] elapsed: {elapsed:.5f} s")
-
-                # torch.cuda.synchronize()
-                # t_fit0 = time.perf_counter()
-                fit = torch.sum(p * d**2)                        # soft responsibilities
-                # torch.cuda.synchronize()
-                # elapsed = time.perf_counter() - t_fit0
-                # print(f"[sq_fit] elapsed: {elapsed:.5f} s")
-
-                # free = free_space_loss(current_ray_samples_flat, theta, b, alpha, ray_ids.numel())
-                
-                if outer %2 == 0 or outer ==0:
-                    step_mod = free_step % n_chunks
-                    if step_mod == 0 and outer > 0:
-                        perm = torch.randperm(R, generator=g, device=directions.device)
-                    
-                    
-                    ray_ids = perm[step_mod*chunk : min((step_mod+1)*chunk, R)]  # (M,)
-                    
-
-        
-                    free_step += 1
-                    dirs = directions[ray_ids]                                   # (M,3)
-                    orig = camera_origin[ray_ids]                                # (M,3)
-
-                    ray_pts = orig[:, None, :] + t_vals[None, :, None] * dirs[:, None, :]   # (M,S,3)
-                    current_ray_samples_flat = (ray_pts.reshape(-1, 3) - t0)                # (M*S,3)
-
-                    # torch.cuda.synchronize()
-                    # t_free0 = time.perf_counter()
-                    free = free_space_loss(current_ray_samples_flat, theta, b, alpha, ray_ids.numel())
-                    # torch.cuda.synchronize()
-                    # elapsed = time.perf_counter() - t_free0
-                    # print(f"[free_space_loss] elapsed: {elapsed:.5f} s")
-                    free_cached = free.detach()
-                    
-                    # with torch.no_grad():
-                    #     raw_scores = sq_inside_near_only(current_ray_samples_flat, theta, b, alpha)
-                    #     worst_F = raw_scores.min().item()
-                    #     soft_worst = torch.sigmoid(-(raw_scores.min() - 1.0) * 20.0).item()
-                    #     violation_worst = torch.relu(1.0 - raw_scores.min()).item()
-                        # print(f"[free-space] outer={outer} "
-                        #       f"free={free.item():.6f} "
-                        #       f"worst_F={worst_F:.4f} "
-                        #       f"soft_inside(worst)={soft_worst:.6f} "
-                        #       f"violation(worst)={violation_worst:.4f}")
-
-                    # torch.cuda.synchronize()
-                    # t_table0 = time.perf_counter()
-                    max_radius = 3.0 * torch.max(theta[2:5]).item()
-                    table_loss = table_transverse_loss(table_pts, theta, max_dist=max_radius)
-                    # torch.cuda.synchronize()
-                    # elapsed = time.perf_counter() - t_table0
-                    # print(f"[table_transverse_loss] elapsed: {elapsed:.5f} s")
-                    table_cached = table_loss.detach()
-
-                    loss = fit + lambda_free * free + lambda_transverse_table*table_loss
-                    # print(f"free_step={free_step}, step_mod={step_mod}, n_chunks={n_chunks}")
-                else:
-                    free = free_cached
-                    table_loss = table_cached
-                    # table_loss = table_transverse_loss(table_pts, theta)
-                    loss = fit + lambda_free * free + lambda_transverse_table*table_loss
-
-
-                
-                # ----- LOG -----
-                # log_row = {
-                #     "iter": int(outer),
-                #     "shape": "superquadric",
-                #     "fit": _to_float(fit),
-                #     "free": _to_float(lambda_free * free),
-                #     "table": _to_float(lambda_transverse_table * table_loss),
-                #     "loss": _to_float(loss),
-                #     "p_mean": _to_float(p.mean()),
-                #     "p_med":  _to_float(p.median()),
-                #     "sigma2": _to_float(sigma2),
-                # }
-                # with torch.no_grad():
-                #     raw_scores = sq_inside_near_only(current_ray_samples_flat, theta, b, alpha)
-                #     free_worst_F = raw_scores.min()
-                
-                
-                # log_row = {
-                #     "iter": int(outer),
-                #     "shape": "superquadric",
-                #     "fit_raw": _to_float(fit),
-                #     "free_raw": _to_float(free),
-                #     "table_raw": _to_float(table_loss),
-                #     "fit_weighted": _to_float(fit),                               # weight is 1.0
-                #     "free_weighted": _to_float(lambda_free * free),
-                #     "table_weighted": _to_float(lambda_transverse_table * table_loss),
-                #     "loss": _to_float(loss),
-                #     "p_mean": _to_float(p.mean()),
-                #     "p_med":  _to_float(p.median()),
-                #     "sigma2": _to_float(sigma2),
-                #     "free_worst_F": _to_float(free_worst_F),                
-                # }
-                # loss_history.append(log_row)
-                
-                ##### DESCOMENTAR PARA SACAR DATOS NO SOLO TIEMPOS 
-                # with torch.no_grad():
-                #     raw_scores = sq_inside_near_only(current_ray_samples_flat, theta, b, alpha)
-                #     free_worst_F = raw_scores.min()
-
-                # raw_log.append({
-                #     "iter": outer,
-                #     "shape": "superquadric",
-                #     "fit_raw": fit.detach(),
-                #     "free_raw": free.detach(),
-                #     "table_raw": table_loss.detach(),
-                #     "fit_weighted": fit.detach(),
-                #     "free_weighted": (lambda_free * free).detach(),
-                #     "table_weighted": (lambda_transverse_table * table_loss).detach(),
-                #     "loss": loss.detach(),
-                #     "p_mean": p.mean().detach(),
-                #     "p_med": p.median().detach(),
-                #     "sigma2": sigma2.detach() if torch.is_tensor(sigma2) else sigma2,
-                #     "free_worst_F": free_worst_F,
-                # })
-                # --------------
-
-                # print("Loss: ", loss)
-                # torch.cuda.synchronize()
-                # t_0 = time.perf_counter()
-                
+                # loss, d, p, fit, free, table_loss = superquadric_step(
+                #     points_centered, theta, static_sigma2, p0, static_w,
+                #     static_ray_samples, chunk,
+                #     table_pts, b, alpha,
+                #     lambda_free, lambda_transverse_table,
+                #     sigma_momentum
+                # )
+                loss, d, p, fit, free, table_loss = superquadric_step(
+                  points_centered, theta, static_sigma2, p0, static_w,
+                  static_ray_samples, chunk,
+                  table_pts, b, alpha,
+                  lambda_free, lambda_transverse_table,
+                  sigma_momentum, static_sigma_update_mask
+              )
                 loss.backward()
-                # torch.cuda.synchronize()
-                # elapsed = time.perf_counter() - t_0
-                # print("outer: ", outer)
-                # print(f"[optimizer backward] elapsed: {elapsed:.5f} s")
-                
-                # torch.cuda.synchronize()
-                # t_0 = time.perf_counter()
                 optimizer.step()
-                # torch.cuda.synchronize()
-                # elapsed = time.perf_counter() - t_0
-                # print(f"[optimizer step] elapsed: {elapsed:.5f} s")
-                
-                if (outer % sigma_every) == 0:
-                    with torch.no_grad():
-                        # torch.cuda.synchronize()
-                        # t_sigma20 = time.perf_counter()
-                        sigma2_new = 2 * torch.sum(p * d**2) / (3 * torch.sum(p) + 1e-8)
-
-                        sigma2 = sigma_momentum * sigma2 + (1.0 - sigma_momentum) * sigma2_new
-                        # torch.cuda.synchronize()
-                        # elapsed = time.perf_counter() - t_sigma20
-                        # print(f"[sigma2] elapsed: {elapsed:.5f} s")       
                 with torch.no_grad():
                     theta[0].clamp_(0.001, 1.99)
                     theta[1].clamp_(0.001, 1.99)
                     theta[2:5].clamp_(0.0001, 1.99)
-                    #theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
+        torch.cuda.current_stream().wait_stream(warmup_stream)
 
-                # c = (2 * np.pi * float(sigma2))**(-1.5)
-                # pmax0 = 1.0 / (1.0 + float(const))
-                # d05   = float(torch.sqrt(sigma2) * np.sqrt(max(1e-12, 2*np.log(1.0/max(1e-12, float(const))))))
+        # --- CAPTURE ---
+        optimizer.zero_grad(set_to_none=True)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            static_loss, static_d, static_p, static_fit, static_free, static_table_loss = superquadric_step(
+                points_centered, theta, static_sigma2, p0, static_w,
+                static_ray_samples, chunk,
+                table_pts, b, alpha,
+                lambda_free, lambda_transverse_table,
+                sigma_momentum, static_sigma_update_mask
+            )
+            static_loss.backward()
+            optimizer.step()
+            with torch.no_grad():
+                theta[0].clamp_(0.001, 1.99)
+                theta[1].clamp_(0.001, 1.99)
+                theta[2:5].clamp_(0.0001, 1.99)
 
-                # theta_prev = theta
-                
+        # --- REAL LOOP: fill buffers + replay ---
+        prev_loss_check = None
+        patience_counter = 0
+        patience_limit = 10
+        check_every = 100
+        min_iters = 500
+
+        for outer in range(T):
+            if outer % freeze_every == 0:
+                print("One e-step multiple M-steps")
+            else:
+                _fill_static_buffers(outer, free_step, perm)
+                free_step += 1
+
+                # handle perm reshuffling (must happen in Python, outside the graph)
+                step_mod = free_step % n_chunks
+                if step_mod == 0:
+                    perm = torch.randperm(R, generator=g_rand, device=directions.device)
+                    if R_padded > R:
+                        pad = perm[:R_padded - R]
+                        perm = torch.cat([perm, pad], dim=0)
+
+                g.replay()
+
                 if outer % 100 == 0:
-                    print(f"outer {outer}: Loss = {loss.item()}")
-                    
-                # ---- EARLY STOPPING ----
+                    print(f"outer {outer}: Loss = {static_loss.item()}")
+
                 if outer % check_every == 0 and outer >= min_iters:
-                    current_loss = loss.item()   # un solo .item() cada check_every iteraciones, coste despreciable
+                    current_loss = static_loss.item()
                     if prev_loss_check is not None:
                         rel_improvement = abs(prev_loss_check - current_loss) / (abs(prev_loss_check) + 1e-8)
                         if rel_improvement < 1e-4:
@@ -3285,6 +3210,284 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
                     if patience_counter >= patience_limit:
                         print(f"[early stop] outer={outer}, loss={current_loss:.6f}, converged (patience={patience_limit})")
                         break
+        # --- static buffers for CUDA Graph capture ---
+        # static_sigma2 = sigma2.detach().clone()   # sigma2 ya es tensor, lo clonamos como buffer persistente
+        # static_w = torch.tensor(w0, device=theta.device, dtype=theta.dtype)   # w como tensor, no float
+        # static_ray_samples = torch.empty(
+        #     chunk * S, 3, device=theta.device, dtype=theta.dtype
+        # )  # mismo tamaño que current_ray_samples_flat siempre (chunk*S, 3)
+        
+        
+        
+        # for outer in range(T):
+        #     if outer % freeze_every == 0:
+        #         print("One e-step multiple M-steps")
+
+        #     else:
+        #         # --- compute this iteration's w value, write it into the static buffer ---
+        #         t = outer/float(T-1)
+        #         s = max(0.0, (t-ramp_start)/(1-ramp_start))
+        #         w_value = (1.0-s)*w0+s*w_final
+        #         static_w.copy_(torch.tensor(w_value, device=theta.device, dtype=theta.dtype))
+
+        #         # --- pick this iteration's ray chunk, write it into the static buffer ---
+        #         step_mod = free_step % n_chunks
+        #         if step_mod == 0 and outer > 0:
+        #             perm = torch.randperm(R, generator=g, device=directions.device)
+        #             if R_padded > R:
+        #                 pad = perm[:R_padded - R]
+        #                 perm = torch.cat([perm, pad], dim=0)
+        #         ray_ids = perm[step_mod*chunk : (step_mod+1)*chunk]
+        #         free_step += 1
+        #         dirs = directions[ray_ids]
+        #         orig = camera_origin[ray_ids]
+        #         ray_pts = orig[:, None, :] + t_vals[None, :, None] * dirs[:, None, :]
+        #         static_ray_samples.copy_(ray_pts.reshape(-1, 3) - t0)
+
+        #         optimizer.zero_grad(set_to_none=True)
+
+        #         # loss, sigma2, d, p, fit, free, table_loss = superquadric_step(
+        #         #     points_centered, theta, sigma2, p0, static_w,
+        #         #     static_ray_samples, chunk,
+        #         #     table_pts,
+        #         #     b, alpha,
+        #         #     lambda_free, lambda_transverse_table,
+        #         #     sigma_momentum
+        #         # )
+                
+        #         loss, d, p, fit, free, table_loss = superquadric_step(
+        #             points_centered, theta, static_sigma2, p0, static_w,
+        #             static_ray_samples, chunk,
+        #             table_pts,
+        #             b, alpha,
+        #             lambda_free, lambda_transverse_table,
+        #             sigma_momentum
+        #         )
+                
+        #         loss.backward()
+        #         optimizer.step()
+
+        #         with torch.no_grad():
+        #             theta[0].clamp_(0.001, 1.99)
+        #             theta[1].clamp_(0.001, 1.99)
+        #             theta[2:5].clamp_(0.0001, 1.99)
+
+        #         if outer % 100 == 0:
+        #             print(f"outer {outer}: Loss = {loss.item()}")
+
+        #         # ---- EARLY STOPPING ----
+        #         if outer % check_every == 0 and outer >= min_iters:
+        #             current_loss = loss.item()
+        #             if prev_loss_check is not None:
+        #                 rel_improvement = abs(prev_loss_check - current_loss) / (abs(prev_loss_check) + 1e-8)
+        #                 if rel_improvement < 1e-4:
+        #                     patience_counter += 1
+        #                 else:
+        #                     patience_counter = 0
+        #             prev_loss_check = current_loss
+
+        #             if patience_counter >= patience_limit:
+        #                 print(f"[early stop] outer={outer}, loss={current_loss:.6f}, converged (patience={patience_limit})")
+        #                 break
+            # else:
+            #     # --- soft-EM normal (un step) ---
+            #     t = outer/float(T-1)
+            #     s = max(0.0, (t-ramp_start)/(1-ramp_start))
+            #     w = (1.0-s)*w0+s*w_final
+                
+            #     optimizer.zero_grad(set_to_none=True)
+            #     # torch.cuda.synchronize()
+            #     # t_d0 = time.perf_counter()
+            #     d = sq_distances(points_centered, theta)  # shape (N,)
+            #     # d = sq_distances_scripted(points_centered, theta)  # shape (N,)
+            #     # torch.cuda.synchronize()
+            #     # elapsed = time.perf_counter() - t_d0
+            #     # print(f"[sq_distances] elapsed: {elapsed:.4f} s")
+                
+                        
+
+
+            #     # responsibilities from current θ, but no grad through p
+            #     with torch.no_grad():
+            #         # torch.cuda.synchronize()
+            #         # t_p0 = time.perf_counter()
+            #         p,const = compute_p_from_dist(d, sigma2, p0, w)
+            #         # p,const = compute_p_from_dist_scripted(d, sigma2, p0, w)
+
+            #         #p = p.clamp_(1e-6, 1-1e-6)  # same as your old behavior
+            #         # torch.cuda.synchronize()
+            #         # elapsed = time.perf_counter() - t_p0
+            #         # print(f"[sq_probabilities] elapsed: {elapsed:.5f} s")
+
+            #     # torch.cuda.synchronize()
+            #     # t_fit0 = time.perf_counter()
+            #     fit = torch.sum(p * d**2)                        # soft responsibilities
+            #     # torch.cuda.synchronize()
+            #     # elapsed = time.perf_counter() - t_fit0
+            #     # print(f"[sq_fit] elapsed: {elapsed:.5f} s")
+
+            #     # free = free_space_loss(current_ray_samples_flat, theta, b, alpha, ray_ids.numel())
+                
+            #     if outer %2 == 0 or outer ==0:
+            #         step_mod = free_step % n_chunks
+            #         if step_mod == 0 and outer > 0:
+            #             perm = torch.randperm(R, generator=g, device=directions.device)
+            #             if R_padded > R:
+            #                 pad = perm[:R_padded - R]
+            #                 perm = torch.cat([perm, pad], dim=0)
+                    
+            #         ray_ids = perm[step_mod*chunk : (step_mod+1)*chunk] 
+                    
+
+        
+            #         free_step += 1
+            #         dirs = directions[ray_ids]                                   # (M,3)
+            #         orig = camera_origin[ray_ids]                                # (M,3)
+
+            #         ray_pts = orig[:, None, :] + t_vals[None, :, None] * dirs[:, None, :]   # (M,S,3)
+            #         current_ray_samples_flat = (ray_pts.reshape(-1, 3) - t0)                # (M*S,3)
+
+            #         # torch.cuda.synchronize()
+            #         # t_free0 = time.perf_counter()
+            #         free = free_space_loss(current_ray_samples_flat, theta, b, alpha, ray_ids.numel())
+            #         # torch.cuda.synchronize()
+            #         # elapsed = time.perf_counter() - t_free0
+            #         # print(f"[free_space_loss] elapsed: {elapsed:.5f} s")
+            #         free_cached = free.detach()
+                    
+
+            #         # max_radius = 3.0 * torch.max(theta[2:5]).item()
+            #         table_loss = table_transverse_loss_graph_safe(table_pts, theta)
+            #         # torch.cuda.synchronize()
+            #         # elapsed = time.perf_counter() - t_table0
+            #         # print(f"[table_transverse_loss] elapsed: {elapsed:.5f} s")
+            #         table_cached = table_loss.detach()
+
+            #         loss = fit + lambda_free * free + lambda_transverse_table*table_loss
+            #         # print(f"free_step={free_step}, step_mod={step_mod}, n_chunks={n_chunks}")
+            #     else:
+            #         free = free_cached
+            #         table_loss = table_cached
+            #         # table_loss = table_transverse_loss(table_pts, theta)
+            #         loss = fit + lambda_free * free + lambda_transverse_table*table_loss
+
+
+                
+            #     # ----- LOG -----
+            #     # log_row = {
+            #     #     "iter": int(outer),
+            #     #     "shape": "superquadric",
+            #     #     "fit": _to_float(fit),
+            #     #     "free": _to_float(lambda_free * free),
+            #     #     "table": _to_float(lambda_transverse_table * table_loss),
+            #     #     "loss": _to_float(loss),
+            #     #     "p_mean": _to_float(p.mean()),
+            #     #     "p_med":  _to_float(p.median()),
+            #     #     "sigma2": _to_float(sigma2),
+            #     # }
+            #     # with torch.no_grad():
+            #     #     raw_scores = sq_inside_near_only(current_ray_samples_flat, theta, b, alpha)
+            #     #     free_worst_F = raw_scores.min()
+                
+                
+            #     # log_row = {
+            #     #     "iter": int(outer),
+            #     #     "shape": "superquadric",
+            #     #     "fit_raw": _to_float(fit),
+            #     #     "free_raw": _to_float(free),
+            #     #     "table_raw": _to_float(table_loss),
+            #     #     "fit_weighted": _to_float(fit),                               # weight is 1.0
+            #     #     "free_weighted": _to_float(lambda_free * free),
+            #     #     "table_weighted": _to_float(lambda_transverse_table * table_loss),
+            #     #     "loss": _to_float(loss),
+            #     #     "p_mean": _to_float(p.mean()),
+            #     #     "p_med":  _to_float(p.median()),
+            #     #     "sigma2": _to_float(sigma2),
+            #     #     "free_worst_F": _to_float(free_worst_F),                
+            #     # }
+            #     # loss_history.append(log_row)
+                
+            #     ##### DESCOMENTAR PARA SACAR DATOS NO SOLO TIEMPOS 
+            #     # with torch.no_grad():
+            #     #     raw_scores = sq_inside_near_only(current_ray_samples_flat, theta, b, alpha)
+            #     #     free_worst_F = raw_scores.min()
+
+            #     # raw_log.append({
+            #     #     "iter": outer,
+            #     #     "shape": "superquadric",
+            #     #     "fit_raw": fit.detach(),
+            #     #     "free_raw": free.detach(),
+            #     #     "table_raw": table_loss.detach(),
+            #     #     "fit_weighted": fit.detach(),
+            #     #     "free_weighted": (lambda_free * free).detach(),
+            #     #     "table_weighted": (lambda_transverse_table * table_loss).detach(),
+            #     #     "loss": loss.detach(),
+            #     #     "p_mean": p.mean().detach(),
+            #     #     "p_med": p.median().detach(),
+            #     #     "sigma2": sigma2.detach() if torch.is_tensor(sigma2) else sigma2,
+            #     #     "free_worst_F": free_worst_F,
+            #     # })
+            #     # --------------
+
+            #     # print("Loss: ", loss)
+            #     # torch.cuda.synchronize()
+            #     # t_0 = time.perf_counter()
+                
+            #     loss.backward()
+            #     # torch.cuda.synchronize()
+            #     # elapsed = time.perf_counter() - t_0
+            #     # print("outer: ", outer)
+            #     # print(f"[optimizer backward] elapsed: {elapsed:.5f} s")
+                
+            #     # torch.cuda.synchronize()
+            #     # t_0 = time.perf_counter()
+            #     optimizer.step()
+            #     # torch.cuda.synchronize()
+            #     # elapsed = time.perf_counter() - t_0
+            #     # print(f"[optimizer step] elapsed: {elapsed:.5f} s")
+                
+            #     if (outer % sigma_every) == 0:
+            #         with torch.no_grad():
+            #             # torch.cuda.synchronize()
+            #             # t_sigma20 = time.perf_counter()
+            #             sigma2_new = 2 * torch.sum(p * d**2) / (3 * torch.sum(p) + 1e-8)
+
+            #             sigma2 = sigma_momentum * sigma2 + (1.0 - sigma_momentum) * sigma2_new
+            #             # torch.cuda.synchronize()
+            #             # elapsed = time.perf_counter() - t_sigma20
+            #             # print(f"[sigma2] elapsed: {elapsed:.5f} s")       
+            #     with torch.no_grad():
+            #         theta[0].clamp_(0.001, 1.99)
+            #         theta[1].clamp_(0.001, 1.99)
+            #         theta[2:5].clamp_(0.0001, 1.99)
+            #         #theta[5:8] = (theta[5:8] + torch.pi) % (2 * torch.pi) - torch.pi
+
+            #     # c = (2 * np.pi * float(sigma2))**(-1.5)
+            #     # pmax0 = 1.0 / (1.0 + float(const))
+            #     # d05   = float(torch.sqrt(sigma2) * np.sqrt(max(1e-12, 2*np.log(1.0/max(1e-12, float(const))))))
+
+            #     # theta_prev = theta
+                
+            #     if outer % 100 == 0:
+            #         print(f"outer {outer}: Loss = {loss.item()}")
+                    
+            #     # ---- EARLY STOPPING ----
+            #     if outer % check_every == 0 and outer >= min_iters:
+            #         current_loss = loss.item()   # un solo .item() cada check_every iteraciones, coste despreciable
+            #         if prev_loss_check is not None:
+            #             rel_improvement = abs(prev_loss_check - current_loss) / (abs(prev_loss_check) + 1e-8)
+            #             if rel_improvement < 1e-4:
+            #                 patience_counter += 1
+            #             else:
+            #                 patience_counter = 0
+            #         prev_loss_check = current_loss
+
+            #         if patience_counter >= patience_limit:
+            #             print(f"[early stop] outer={outer}, loss={current_loss:.6f}, converged (patience={patience_limit})")
+            #             break
+                      
+                      
+                      
         # for entry in raw_log:
         #     log_row = {
         #         "iter": int(entry["iter"]),
@@ -3339,8 +3542,8 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
         k_np = 0
         free_space_penalty1 = 0
         
-        # distances_final = sq_distances(points_centered, theta).detach().cpu().numpy()
-        distances_final = sq_distances_scripted(points_centered, theta).detach().cpu().numpy()
+        distances_final = sq_distances(points_centered, theta).detach().cpu().numpy()
+        # distances_final = sq_distances_scripted(points_centered, theta).detach().cpu().numpy()
 
         if selected_indices_good.size>0:
             # Now sample along these rays
@@ -3374,10 +3577,13 @@ def fit_shape_to_cluster(cluster_points_np, shape = 'superquadric', init_theta=N
             fit = torch.sum(p * d**2)                        # soft responsibilities
             step_mod = outer % n_chunks
             if step_mod == 0 and outer > 0:
-                perm = torch.randperm(R, generator=g, device=directions.device)
+                perm = torch.randperm(R, generator=g_rand, device=directions.device)
+                if R_padded > R:
+                    pad = perm[:R_padded-R]
+                    perm = torch.cat([perm, pad])
                 
-                
-            ray_ids = perm[step_mod*chunk : min((step_mod+1)*chunk, R)]  # (M,)
+            ray_ids = perm[step_mod*chunk : (step_mod+1)*chunk]  # (M,)
+            
             dirs = directions[ray_ids]                                     # (M,3)
             orig = camera_origin[ray_ids]                                        # (M,3)
 
@@ -3678,511 +3884,4 @@ def lr_wd_from_N(N, N_ref=2000, lr_ref=3e-3, wd_ref=1e-3, power=1.0):
     wd = wd_ref / scale                 # so lr * wd ≈ constant
     return lr, wd
 
-# ################ PARAMETERS ###############
-# scene_ = "scene_48"
-# N_ref_ = 1000
-# base_lr_ = 1e-3
-# T_ = 1000
-# K_=3
-# freeze_every_ = T_
-# sigma_momentum_ = 0.0    # EMA for sigma2
-# sigma_every_ = 1         # update cadence
-# lambda_free_ = 120.0
-# lambda_transverse_table_ = 10.0
-# lambda_mass_ = 0.0
-# w0_=0.05
-# w_final_ = 0.35
-# ramp_start_ = 0.7
-# T_supertoroid_ = 100
-# lambda_free_supertoroid_ = 30.0
-# lambda_transverse_table_supertoroid_ = 10.0
 
-# T_superparaboloid_ = 2000
-# number_samples_per_ray_ = 300
-# weight_decay_ = 0.01
-
-# params = {
-#     "scene_": scene_,
-#     "N_ref_": N_ref_,
-#     "base_lr_": base_lr_,
-#     "T_": T_,
-#     "K_": K_,
-#     "freeze_every_": freeze_every_,
-#     "sigma_momentum_": sigma_momentum_,
-#     "sigma_every_": sigma_every_,
-#     "lambda_free_": lambda_free_,
-#     "lambda_transverse_table_": lambda_transverse_table_,
-#     "lambda_mass_": lambda_mass_,
-#     "w0_": w0_,
-#     "w_final_": w_final_,
-#     "ramp_start_": ramp_start_,
-#     "T_supertoroid_": T_supertoroid_,
-#     "lambda_free_supertoroid_": lambda_free_supertoroid_,
-#     "T_superparaboloid_": T_superparaboloid_,
-#     "number_samples_per_ray_": number_samples_per_ray_,
-#     "weight_decay_": weight_decay_,
-# }
-
-# base_path = "/home/elisabeth/repos/ProbabilisticSuperquadricFitting/results"
-
-# scene_dir = Path(base_path) / scene_
-# scene_dir.mkdir(parents=True, exist_ok=True)
-
-# try:
-#     test_n  # noqa: F821
-# except NameError:
-#     test_n = _next_test_num(scene_dir)
-    
-# out_dir = scene_dir / f"test{test_n}"
-# out_dir.mkdir(exist_ok=True)
-
-# # --- write params once (won't overwrite if already present)
-# params_path = out_dir / "params.yaml"
-# if not params_path.exists():
-#     run_params = {
-#         "scene_": scene_,
-#         "N_ref_": N_ref_,
-#         "base_lr_": base_lr_,
-#         "T_": T_,
-#         "K_": K_,
-#         "freeze_every_": freeze_every_,
-#         "sigma_momentum_": sigma_momentum_,
-#         "sigma_every_": sigma_every_,
-#         "lambda_free_": lambda_free_,
-#         "lambda_transverse_table_": lambda_transverse_table_,
-#         "lambda_mass_": lambda_mass_,
-#         "w0_": w0_,
-#         "w_final_": w_final_,
-#         "ramp_start_": ramp_start_,
-#         "T_supertoroid_": T_supertoroid_,
-#         "lambda_free_supertoroid_": lambda_free_supertoroid_,
-#         "T_superparaboloid_": T_superparaboloid_,
-#         "number_samples_per_ray_": number_samples_per_ray_,
-#         "weight_decay_": weight_decay_,
-#     }
-#     params_path.write_text("# ################ PARAMETERS ###############\n" + _dump(run_params))
-
-
-# # point_cloud = read_ply("data/objects7.ply")
-# # point_cloud = remove_close_points(point_cloud, 0.005)
-
-# # point_cloud = filter_by_z(point_cloud, -np.inf, 1.94)
-
-# # all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
-
-
-
-# # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-# # showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
-
-# point_cloud = read_with_open3d("data/sceneReplica/final_scenes/pcds/"+scene_+"/cloud.pcd")
-# point_cloud = remove_close_points(point_cloud, 0.003)
-# filtered_points, plane_points, plane_model = remove_largest_plane(point_cloud, distance_threshold=0.003)
-# filtered_points, plane_points1, plane_model1 = remove_largest_plane(filtered_points, distance_threshold=0.003)
-# point_cloud = filter_by_z(point_cloud, -np.inf, 1.5)
-# all_points = torch.from_numpy(point_cloud).float().cuda()         # convert to CUDA tensor
-
-# # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-# # showPoints(filtered_points, scale_factor=0.0025, color=(0,0.5,0.5))
-# # showPoints(np.array([[0,0,0]]))
-# # mlab.show()
-
-
-
-
-# print("plane model: ", plane_model)
-
-# table_normal = torch.tensor(plane_model[:3], dtype=torch.float32, device='cuda')
-
-# # points_np: (N,3) from your /head_camera/depth_registered/points (same camera!)
-# # seg_png: color segmentation aligned with that camera (same resolution)
-# labels, id2color = load_seg_as_labels("data/sceneReplica/final_scenes/segmasks/"+scene_+"/gtseg_ord-nearest_first_step-0.png", inflate_px=10)
-# point_labels = label_points_from_seg(filtered_points, labels)
-# clusters = split_points_by_label(filtered_points, point_labels)
-
-# # clusters_pruned, rep = prune_clusters_like(
-# #     clusters,
-# #     dbscan_min_samples=20,
-# #     keep_quantile=0.95,
-# #     min_points_after=30,
-# #     gap_min=0.01,        # 5 cm gap to drop tiny islands
-# #     rel_size_max=0.30    # drop components <20% of main if also far
-# # )
-
-# # # for lab, r in rep.items():
-# # #     print(f"label {lab}: {r['orig']} -> {r['kept']} (dropped {r['dropped']})")
-
-# # clusters = clusters_pruned
-# print("clusters", clusters)
-# # # clusters[k] is Nx3 for each object; id2color[k] gives its RGB color.
-
-# # p= None
-# # kmeans = KMeans(n_clusters=4).fit(filtered_points)
-# # clustering = DBSCAN(eps=0.03, min_samples=6).fit(filtered_points)
-# # n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
-# # print(f"Number of clusters: {n_clusters}")
-
-# camera_origin = torch.zeros_like(all_points)  # shape (N, 3), all (0,0,0)
-# directions = all_points - camera_origin  # or just points if origin is (0,0,0)
-
-# # Now sample along these rays
-# number_samples_per_ray = 120
-# number_of_rays = all_points.shape[0]
-
-# t_vals = torch.linspace(0.03, 1.1, number_samples_per_ray, device=all_points.device)  # go slightly past the surface
-# ray_points = camera_origin[:, None, :] + t_vals[None, :, None] * directions[:, None, :]
-# ray_samples_flat = ray_points.reshape(-1, 3)
-
-# k = torch.tensor(0.6)
-# k = torch.nn.Parameter(k)
-
-
-# all_params_modeled = {}
-# idx = 0
-# # for i in range(0, len(clusters)-1):
-# for lid, cluster in clusters.items():
-#     print(lid, cluster.shape)                    # each pts is Nx3
-#     loss_per_iteration = []
-#     if lid ==4 or lid ==2 or lid==3 or lid==5:
-#       continue
-#     current_cluster = cluster
-
-#     sub_idx = 0
-    
-#     theta_np_sq = None
-#     queue = deque([current_cluster])
-    
-#     while queue:
-#         current_cluster = queue.popleft()
-#         fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-#         mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-#         showPoints(current_cluster, scale_factor=0.0025, color = (0.894, 0.447, 0.0))
-#         showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-#         mlab.show()
-        
-#         if current_cluster.shape[0]<=12:
-#           continue
-#         theta_np, k_np, b_np, alpha_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty, distances, loss_history_se = fit_shape_to_cluster(current_cluster, 'superquadric', plane_model=plane_model)
-#         print("selected indices good: ", selected_indices_good.shape)
-#         print("theta_np: ", theta_np)
-#         print("b_np: ", b_np)
-#         print("alpha_np: ", alpha_np)
-        
-#         all_params_modeled[idx] = {"cluster": lid,"type": "superquadric", "theta": theta_np, "k": 0, "b": b_np, "alpha": alpha_np, "free_space_penalty":free_space_penalty, 
-#                                   "indices_good": selected_indices_good, "indices_bad": selected_indices_bad, "indices_remaining": remaining_indices}
-#         idx +=1
-        
-#         fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-#         mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-#         showPoints(current_cluster[selected_indices_good], scale_factor=0.002, color=(1.0, 0.992, 0.157))
-#         if selected_indices_bad.size >0:
-#             showPoints(current_cluster[selected_indices_bad], scale_factor=0.002, color=(0.224, 0.004, 0.278))
-#         showPoints(current_cluster[remaining_indices], scale_factor=0.002, color=(0.243, 0.675, 0.647))
-#         showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-#         showSuperquadrics(theta_np, b_np, alpha_np)
-#         mlab.show()
-        
-#         theta_np_sq = theta_np
-#         # else:
-#         #     theta_np, k_np, selected_indices_good, remaining_indices, selected_indices_bad, free_space_penalty = fit_shape_to_cluster(current_cluster, False)
-#         #     current_cluster = current_cluster[selected_indices_bad]
-#         #     all_params_modeled[idx] = {"type": "superparaboloid", "theta": theta_np, "k": k_np}
-#         #     idx+=1
-#             # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-#             # showPoints(cluster[selected_indices_good], scale_factor=0.01, color=(0,1,0))
-#             # if selected_indices_bad.size >0:
-#             #     showPoints(cluster[selected_indices_bad], scale_factor=0.01, color=(1,0,0))
-#             # showPoints(cluster[remaining_indices], scale_factor=0.01, color=(0,0,1))
-#             # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
-#             # showTaperedSuperparaboloidWithBase(theta_np,k_np)
-#             # mlab.show()
-        
-        
-#         print("all_params", all_params_modeled)
-#         for id, params in list(all_params_modeled.items())[-1:]:
-#           if params["free_space_penalty"]>=0.015 or params["indices_good"].shape[0] == 0:
-#               print("good: ",params["indices_good"])
-#               print("Before selected indices good: ", params["indices_good"].shape)
-#               print("free_space_penalty: ", params["free_space_penalty"])
-#               # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-#               # showPoints(current_cluster[params["indices_good"]], scale_factor=0.01, color=(0,1,0))
-#               # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
-#               # mlab.show()
-              
-#               good1 = as_idx1d(params["indices_good"])           # from the 1st (SQ) fit, relative to current_cluster
-#               bad1 = as_idx1d(params["indices_bad"])
-#               remaining_indices1  = as_idx1d(params["indices_remaining"])
-
-#               used_indices = None
-#               # If the first fit had no good points, skip carryover entirely
-              
-#               print("good1.size: ", good1.size)
-#               if good1.size == 0:
-#                   remaining_indices_for_toroid = np.union1d(remaining_indices1, bad1)
-#                   used_indices = remaining_indices_for_toroid
-#                   sub_pts = current_cluster[used_indices]
-#               else:
-#                   used_indices = np.union1d(good1, remaining_indices1)
-#                   sub_pts = current_cluster[used_indices]                  # pass exactly these to the paraboloid fit
-              
-              
-#               # fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-#               # showPoints(sub_pts, scale_factor=0.01, color=(0,1,0))
-#               # showPoints(point_cloud, scale_factor=0.005, color=(0,0.5,0.5))
-#               # mlab.show()
-              
-#               theta_np, k_np, b_np, alpha_np, selected_indices_good2, remaining_indices2, selected_indices_bad2, free_space_penalty, distances_st, loss_history_st = fit_shape_to_cluster(sub_pts, 'supertoroid', plane_model=plane_model)
-#               distances_st = distances_st[selected_indices_good2]
-              
-#               d = np.asarray(distances_st).reshape(-1)              # shape (N_sub,)
-#               idx_st = np.asarray(selected_indices_good2, dtype=np.int64)
-
-#               # Limpieza/seguridad por si viene algún índice fuera de rango
-#               N_st = d.shape[0]
-#               idx_st = idx_st[(idx_st >= 0) & (idx_st < N_st)]
-#               if idx_st.size == 0:
-#                   sum_st_distances_good = float('inf')
-#                   mean_st_distances_good = float('inf')
-#               else:
-#                   # (opcional) quitar duplicados y ordenar
-#                   idx_st = np.unique(idx_st)
-#                   sum_st_distances_good = float(np.nansum(d[idx_st]**2))
-#                   mean_st_distances_good = float(np.nanmean(d[idx_st]**2))
-#                   J_st, G_st, mse_st = option1_score(d**2, selected_indices_good2, sub_pts.shape[0])         
-              
-              
-#               fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-#               mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-#               showPoints(sub_pts[selected_indices_good2], scale_factor=0.002, color=(1.0, 0.992, 0.157))
-#               if selected_indices_bad2.size >0:
-#                   showPoints(sub_pts[selected_indices_bad2], scale_factor=0.002, color=(0.224, 0.004, 0.278))
-#               showPoints(sub_pts[remaining_indices2], scale_factor=0.002, color=(0.243, 0.675, 0.647))
-#               showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-#               showSupertoroid(theta_np)
-#               mlab.show()
-              
-              
-#               theta_np_sp, k_np_sp, b_np_sp, alpha_np_sp, selected_indices_good2_sp, remaining_indices2_sp, selected_indices_bad2_sp, free_space_penalty_sp, distances_sp, loss_history_sp = fit_shape_to_cluster(sub_pts, 'superparaboloid', plane_model=plane_model)
-
-#               idx_sp = np.asarray(selected_indices_good2_sp, dtype=np.int64)
-
-#               # Limpieza/seguridad por si viene algún índice fuera de rango
-#               N_sp = d.shape[0]
-#               idx_sp = idx_sp[(idx_sp >= 0) & (idx_sp < N_sp)]
-#               if idx_sp.size == 0:
-#                   sum_sp_distances_good = float('inf')
-#                   mean_sp_distances_good = float('inf')
-#               else:
-#                   # (opcional) quitar duplicados y ordenar
-#                   idx_sp = np.unique(idx_sp)
-#                   sum_sp_distances_good = float(np.nansum(d[idx_sp]**2))
-#                   mean_sp_distances_good = float(np.nanmean(d[idx_sp]**2))
-#                   J_sp, G_sp, mse_sp = option1_score(d**2, selected_indices_good2_sp, sub_pts.shape[0])     
-                  
-              
-#               print("-------------------------------- Superparaboloid ------------------------------")
-#               print("good sp: ", selected_indices_good2_sp)
-#               print("bad sp: ", selected_indices_bad2_sp)
-#               print("remaining sp: ", remaining_indices2_sp)
-              
-#               fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-#               mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-#               showPoints(sub_pts[selected_indices_good2_sp], scale_factor=0.002, color=(1.0, 0.992, 0.157))
-#               if selected_indices_bad2_sp.size >0:
-#                   showPoints(sub_pts[selected_indices_bad2_sp], scale_factor=0.002, color=(0.224, 0.004, 0.278))
-#               showPoints(sub_pts[remaining_indices2_sp], scale_factor=0.002, color=(0.243, 0.675, 0.647))
-#               showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-#               showTaperedSuperparaboloidWithBase(theta_np_sp, k_np_sp)
-#               mlab.show()
-              
-
-
-#               if J_sp<J_st and selected_indices_good2_sp.size!=0:
-#                   theta_np = theta_np_sp
-#                   k_np = k_np_sp
-#                   alpha_np = alpha_np_sp
-#                   selected_indices_good2 = selected_indices_good2_sp
-#                   remaining_indices2 = remaining_indices2_sp
-#                   selected_indices_bad2 = selected_indices_bad2_sp
-#                   free_space_penalty = free_space_penalty_sp
-              
-#                   params["type"] = "superparaboloid"
-#                   params["theta"] = theta_np
-#                   params["k"] = k_np
-#                   params["free_space_penalty"]=free_space_penalty
-                  
-#                   loss_history = loss_history_sp
-#                   loss_payload = {
-#                       "scene": scene_,
-#                       "test": int(test_n),
-#                       "cluster_id": int(lid),
-#                       "sub_id": int(sub_idx),
-#                       "shape": "superparaboloid",
-#                       "n_points": int(current_cluster.shape[0]),
-#                       "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-#                       "history": loss_history,  # list[dict]
-#                   }
-#                   cluster_dir = out_dir / f"cluster{lid}"
-#                   loss_file = cluster_dir / f"sub{sub_idx}_loss.yaml"
-#                   _dump_yaml(loss_payload, loss_file)
-#                   print("Saved loss history:", loss_file)
-#                   sub_idx +=1
-#               else:
-#                   params["type"] = "supertoroid"
-#                   params["theta"] = theta_np
-#                   params["free_space_penalty"]=free_space_penalty
-#                   loss_history = loss_history_st
-#                   loss_payload = {
-#                       "scene": scene_,
-#                       "test": int(test_n),
-#                       "cluster_id": int(lid),
-#                       "sub_id": int(sub_idx),
-#                       "shape": "supertoroid",
-#                       "n_points": int(current_cluster.shape[0]),
-#                       "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-#                       "history": loss_history,  # list[dict]
-#                   }
-#                   cluster_dir = out_dir / f"cluster{lid}"
-#                   loss_file = cluster_dir / f"sub{sub_idx}_loss.yaml"
-#                   _dump_yaml(loss_payload, loss_file)
-#                   print("Saved loss history:", loss_file)
-#                   sub_idx +=1
-#               print("J supertoroid: ", J_st)
-#               print("J superparaboloid: ", J_sp)
-              
-              
-              
-              
-#               selected_indices_good2 = as_idx1d(selected_indices_good2)                           # indices relative to sub_pts
-#               selected_indices_bad2  = as_idx1d(selected_indices_bad2)
-#               remaining_indices2  = as_idx1d(remaining_indices2)
-
-#               # Map back to original current_cluster:
-#               selected_indices_good_p = used_indices[selected_indices_good2]
-#               selected_indices_bad_p  = used_indices[selected_indices_bad2]
-#               remaining_indices_p  = used_indices[remaining_indices2]
-              
-#               if good1.size == 0:
-#                   remaining_indices = remaining_indices_p
-#                   selected_indices_bad = selected_indices_bad2
-#               else:
-#                   remaining_indices =  remaining_indices_p
-#                   selected_indices_bad = np.union1d(selected_indices_bad, selected_indices_bad_p)
-#               print("remaining_indices: ", remaining_indices)
-#               print("selected_indices_bad: ", selected_indices_bad)
-#           else: # superellipsoid
-#             loss_history = loss_history_se
-#             loss_payload = {
-#                 "scene": scene_,
-#                 "test": int(test_n),
-#                 "cluster_id": int(lid),
-#                 "sub_id": int(sub_idx),
-#                 "shape": "superquadric",
-#                 "n_points": int(current_cluster.shape[0]),
-#                 "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-#                 "history": loss_history,  # list[dict]
-#             }
-#             cluster_dir = out_dir / f"cluster{lid}"
-#             loss_file = cluster_dir / f"sub{sub_idx}_loss.yaml"
-#             _dump_yaml(loss_payload, loss_file)
-#             print("Saved loss history:", loss_file)
-#             sub_idx +=1
-
-      
-#         # if selected_indices_good.size == 0 and selected_indices_good2.size == 0 and selected_indices_good2_sp.size==0:
-#         #     continue
-#         next_indices = np.union1d(remaining_indices, selected_indices_bad)
-#         residual = current_cluster[next_indices]
-        
-#         fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-#         mlab.view(azimuth=108.51, elevation=168.97, distance=0.5, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.7), roll=-177.93)
-#         showPoints(residual, scale_factor=0.0025, color=(0.894, 0.447, 0.0))
-#         showPoints(point_cloud, scale_factor=0.001, color=(0.702, 0.702, 0.702))
-#         mlab.show()
-#         print(next_indices.shape)
-#         # mlab.show()
-#         # ---- NEW: subcluster residual and enqueue ----
-#         subclusters = split_by_distance(residual, eps=1e-2, min_samples=5)
-        
-#         print("subclusters: ", len(subclusters))
-#         for sub in subclusters:
-#             if sub.shape[0] > 10:
-#                 queue.append(sub)
-
-# #       showTaperedSuperparaboloidWithBase(params['theta'], params['k'])
-# # showPoints(point_cloud, scale_factor=0.0025, color=(0,0.5,0.5))
-# # mlab.show()
-
-
-# # --- group modeled shapes by cluster from all_params_modeled and dump YAML
-# by_cluster = defaultdict(list)
-# for _i, p in all_params_modeled.items():
-#     lid = int(p["cluster"])
-#     by_cluster[lid].append({
-#         "type": p["type"],
-#         "theta": _to_py(p.get("theta")),
-#         "k": _to_py(p.get("k")),
-#         "b": _to_py(p.get("b")),
-#         "alpha": _to_py(p.get("alpha")),
-#         "free_space_penalty": _to_py(p.get("free_space_penalty")),
-#         "indices_good": _flow_list(p.get("indices_good")),
-#         "indices_bad": _flow_list(p.get("indices_bad")),
-#         "indices_remaining": _flow_list(p.get("indices_remaining")),
-#     })                
-
-
-# for lid, shapes in by_cluster.items():
-#     payload = {
-#         "scene": scene_,
-#         "test": int(test_n),
-#         "cluster_id": int(lid),
-#         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-#         "n_shapes": len(shapes),
-#         "shapes": shapes,
-#     }
-#     out_file = out_dir / f"cluster{lid}.yaml"
-#     out_file.write_text("# ############## CLUSTER RESULTS ##############\n" + _dump(payload))
-#     print("Saved", out_file)
-
-# import sys
-
-# def print_camera_view(fig):
-#     az, el, dist, fp = mlab.view(figure=fig)
-#     roll = mlab.roll(figure=fig)
-#     print(f"Azimuth: {az:.2f}  Elevation: {el:.2f}  Distance: {dist:.4f}")
-#     print(f"Focal Point: {tuple(fp)}")
-#     print(f"Roll: {roll:.2f}")
-#     print("-"*50)
-#     sys.stdout.flush()
-
-# # --- fire on interaction (drag/zoom/rotate) ---
-# def _on_interaction(obj, evt):
-#     print_camera_view(fig)
-
-# def _on_end_interaction(obj, evt):
-#     print_camera_view(fig)
-
-
-# print(all_params_modeled)
-
-# fig = mlab.figure(size=(400, 400), bgcolor=(1, 1, 1))
-# # mlab.figure(fig)  # make it current
-# # fig.scene.interactor.add_observer("InteractionEvent", _on_interaction)
-# # Print on every camera move (use 'EndInteractionEvent' to print only when the user releases)
-# # fig.scene.interactor.add_observer('InteractionEvent', on_interaction)
-
-# mlab.view(azimuth=108.51, elevation=168.97, distance=0.5805, focalpoint=(0.14501899292528592, -0.018065290097470238, 0.864720847838999), roll=-177.93)
-# for idx,params in all_params_modeled.items():
-#     if params["type"] == "superquadric":
-#       showSuperquadrics(params['theta'], params["b"], params["alpha"])
-#     elif params["type"] == "supertoroid":
-#       showSupertoroid(params['theta'])
-#     else:
-#       showTaperedSuperparaboloidWithBase(params["theta"], params["k"])
-# showPoints(point_cloud, scale_factor=0.0025, color=(0.702, 0.702, 0.702), figure=fig)
-# print_camera_view(fig)
-
-# mlab.show()
-
-
-alpha = 0.0
